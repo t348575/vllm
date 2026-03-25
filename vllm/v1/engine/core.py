@@ -75,6 +75,8 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
+from simple_profiler import profiler
+
 logger = init_logger(__name__)
 
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -212,6 +214,14 @@ class EngineCore:
 
         self.aborts_queue = queue.Queue[list[str]]()
 
+        # request_id -> perf_counter_ns when request was received
+        self._request_start_ns: dict[str, int] = {}
+        # Slot-based TID allocator for request profile spans
+        # slot -> wall-clock ns when it became free (0 = never used)
+        self._req_slot_free_ns: dict[int, int] = {}
+        # request_id -> "req_N" TID string
+        self._req_tid: dict[str, str] = {}
+
         self._idle_state_callbacks: list[Callable] = []
 
         # Mark the startup heap as static so that it's ignored by GC.
@@ -319,6 +329,20 @@ class EngineCore:
                 "Disabling KVTransfer for this request."
             )
 
+        now_ns = time.perf_counter_ns()
+        self._request_start_ns[request.request_id] = now_ns
+        # Allocate a non-overlapping TID slot for this request's profile span
+        chosen = next(
+            (s for s, free in self._req_slot_free_ns.items() if free <= now_ns),
+            len(self._req_slot_free_ns),
+        )
+        self._req_slot_free_ns[chosen] = 10**18  # mark busy until request finishes
+        tid = f"req_{chosen}"
+        self._req_tid[request.request_id] = tid
+        kv_connector = self.scheduler.get_kv_connector()
+        if kv_connector is not None and hasattr(kv_connector, "set_req_profile_tids"):
+            kv_connector.set_req_profile_tids({request.request_id: tid})
+
         self.scheduler.add_request(request)
 
     def abort_requests(self, request_ids: list[str]):
@@ -387,6 +411,7 @@ class EngineCore:
         if not self.scheduler.has_requests():
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        scheduler_output.req_profile_tids = self._req_tid.copy()
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -403,6 +428,7 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        self._emit_request_spans(engine_core_outputs)
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
 
@@ -445,6 +471,7 @@ class EngineCore:
         deferred_scheduler_output = None
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            scheduler_output.req_profile_tids = self._req_tid.copy()
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
@@ -507,6 +534,7 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        self._emit_request_spans(engine_core_outputs)
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
@@ -533,6 +561,28 @@ class EngineCore:
             batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
 
         return engine_core_outputs, model_executed
+
+    def _emit_request_spans(
+        self, engine_core_outputs: dict[int, EngineCoreOutputs]
+    ) -> None:
+        if not profiler._active:
+            return
+        now_ns = time.perf_counter_ns()
+        for outputs in engine_core_outputs.values():
+            for output in outputs.outputs:
+                if output.finished:
+                    start_ns = self._request_start_ns.pop(output.request_id, None)
+                    tid = self._req_tid.pop(output.request_id, None)
+                    if start_ns is not None and tid is not None:
+                        slot = int(tid.split("_")[1])
+                        self._req_slot_free_ns[slot] = now_ns
+                        profiler.add_event(
+                            name=f"request(id={output.request_id})",
+                            category="request",
+                            start_ns=start_ns,
+                            duration_ns=now_ns - start_ns,
+                            tid=tid,
+                        )
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():
@@ -1028,6 +1078,9 @@ class EngineCoreProc(EngineCore):
     @staticmethod
     def run_engine_core(*args, dp_rank: int = 0, local_dp_rank: int = 0, **kwargs):
         """Launch EngineCore busy loop in background process."""
+
+        from simple_profiler import profiler
+        profiler.begin_session(f"results_engine_core_{dp_rank}.json")
 
         # Ensure we can serialize transformer config after spawning
         maybe_register_config_serialize_by_value()

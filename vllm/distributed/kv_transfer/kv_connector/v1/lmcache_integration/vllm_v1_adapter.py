@@ -36,6 +36,8 @@ except ImportError:
         PluginLauncher as RuntimePluginLauncher,
     )
 
+from simple_profiler import profile_scope
+
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
@@ -613,6 +615,10 @@ class LMCacheConnectorV1Impl:
             self._lookup_requests_in_step: list[str] = []
             self.lmcache_engine = None
         else:
+            from simple_profiler import profiler as _profiler
+            _tp_rank = get_tensor_model_parallel_rank()
+            _profiler.begin_session(f"results_worker{_tp_rank}.json")
+
             self.lmcache_engine = _init_lmcache_engine(
                 config,
                 vllm_config,
@@ -877,8 +883,9 @@ class LMCacheConnectorV1Impl:
                         sync=sync,
                     )
                     # NOTE: retrieve for two layers at the first layer
-                    next(layerwise_retriever)
-                    next(layerwise_retriever)
+                    with profile_scope("lmcache.layerwise_load.init", "lmcache"):
+                        next(layerwise_retriever)
+                        next(layerwise_retriever)
                     self.layerwise_retrievers.append(layerwise_retriever)
             else:
                 ret_token_mask = self.lmcache_engine.retrieve(
@@ -921,7 +928,11 @@ class LMCacheConnectorV1Impl:
 
         # Wait for the layer to be loaded
         for layerwise_retriever in self.layerwise_retrievers:
-            ret_token_mask = next(layerwise_retriever)
+            with profile_scope(
+                f"lmcache.layerwise_load.layer{self.current_layer}",
+                "lmcache",
+            ):
+                ret_token_mask = next(layerwise_retriever)
 
             if self.current_layer == self.num_layers - 1:
                 assert ret_token_mask is not None
@@ -1027,7 +1038,11 @@ class LMCacheConnectorV1Impl:
                     is_first = False
 
         for layerwise_storer in self.layerwise_storers:
-            next(layerwise_storer)
+            with profile_scope(
+                f"lmcache.layerwise_save.layer{self.current_layer}",
+                "lmcache",
+            ):
+                next(layerwise_storer)
 
         self.current_layer += 1
 
@@ -1048,7 +1063,8 @@ class LMCacheConnectorV1Impl:
 
         if self.use_layerwise:
             for layerwise_storer in self.layerwise_storers:
-                next(layerwise_storer)
+                with profile_scope("lmcache.layerwise_save.finalize", "lmcache"):
+                    next(layerwise_storer)
             return
 
         assert len(self.kv_caches) > 0

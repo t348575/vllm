@@ -111,7 +111,9 @@ class OffloadingWorker:
         self.handlers.add(handler)
         self.transfer_type_to_handler[transfer_type] = handler
 
-    def transfer_async(self, job_id: int, spec: TransferSpec) -> bool:
+    def transfer_async(self, job_id: int, spec: TransferSpec,
+                       profile_tid: str = "kv_transfer",
+                       req_id: str = "") -> bool:
         """
         Initiates an asynchronous transfer of KV data.
 
@@ -128,7 +130,7 @@ class OffloadingWorker:
         handler = self.transfer_type_to_handler.get(transfer_type)
         assert handler is not None
         try:
-            success = handler.transfer_async(job_id, spec)
+            success = handler.transfer_async(job_id, spec, profile_tid=profile_tid, req_id=req_id)
         except Exception as e:
             logger.warning(
                 "Exception in %r transfer %d: %r",

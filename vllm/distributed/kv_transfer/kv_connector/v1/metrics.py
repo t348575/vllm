@@ -100,6 +100,9 @@ class KVConnectorLogging:
             # interval from the recorded observations.
             xfer_metrics = self.transfer_stats_accumulator.reduce()
             xfer_metrics_str = ", ".join(f"{k}={v}" for k, v in xfer_metrics.items())
+            if ("GPU_to_CPU_total_bytes" in xfer_metrics or "CPU_to_GPU_total_bytes" in xfer_metrics) and "GPU_to_CPU_total_time" in xfer_metrics:
+                bytes_transferred = xfer_metrics["GPU_to_CPU_total_bytes"] if "GPU_to_CPU_total_bytes" in xfer_metrics else xfer_metrics["CPU_to_GPU_total_bytes"]
+                xfer_metrics_str += f", bw={(bytes_transferred / xfer_metrics["GPU_to_CPU_total_time"]) / (1024**3)} GB/s"
             log_fn("KV Transfer metrics: %s", xfer_metrics_str)
 
             # Reset metrics for next interval

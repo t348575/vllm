@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -41,6 +42,8 @@ from vllm.v1.kv_offload.worker.worker import (
 )
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
+
+from simple_profiler import profile_scope, profiler
 
 ReqId = str
 
@@ -213,6 +216,15 @@ class OffloadingConnector(KVConnectorBase_V1):
     def take_events(self) -> Iterable[KVCacheEvent]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.take_events()
+
+    def get_req_profile_tid(self, req_id: ReqId) -> str | None:
+        if self.connector_worker is None:
+            return None
+        return self.connector_worker.get_req_profile_tid(req_id)
+
+    def set_req_profile_tids(self, tid_map: dict) -> None:
+        if self.connector_worker is not None:
+            self.connector_worker.set_req_profile_tids(tid_map)
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         if self.connector_worker is None:
@@ -570,6 +582,10 @@ class OffloadingConnectorWorker:
         self.worker = OffloadingWorker()
 
         self._job_counter = 0
+        self._profile_step = 0
+        # Per-request profile TID: slot -> end_ns of last span, req_id -> tid string
+        self._req_profile_slot_end_ns: dict[int, int] = {}
+        self._req_profile_tid: dict[ReqId, str] = {}  # req_id -> "req_N"
 
         self.kv_connector_stats = OffloadingConnectorStats()
         # req_id -> (job_id, store)
@@ -580,6 +596,10 @@ class OffloadingConnectorWorker:
         self._store_jobs = defaultdict[ReqId, set[int]](set)
         # list of store jobs pending submission (job_id, transfer_spec)
         self._unsubmitted_store_jobs: list[tuple[int, TransferSpec]] = []
+        # job_id -> wall-clock time (ns) when the store was queued via prepare_store_kv
+        self._store_queue_time_ns: dict[int, int] = {}
+        # job_id -> wall-clock time (ns) when the load was submitted via start_kv_transfers
+        self._load_submit_time_ns: dict[int, int] = {}
 
         self._finished_reqs_waiting_for_store: set[ReqId] = set()
 
@@ -587,6 +607,31 @@ class OffloadingConnectorWorker:
         job_id = self._job_counter
         self._job_counter = job_id + 1
         return job_id
+
+    def _get_or_alloc_req_tid(self, req_id: ReqId, start_ns: int) -> str:
+        if req_id not in self._req_profile_tid:
+            chosen = None
+            for slot, end in self._req_profile_slot_end_ns.items():
+                if end <= start_ns:
+                    chosen = slot
+                    break
+            if chosen is None:
+                chosen = len(self._req_profile_slot_end_ns)
+                self._req_profile_slot_end_ns[chosen] = 0
+            self._req_profile_tid[req_id] = f"req_{chosen}"
+        return self._req_profile_tid[req_id]
+
+    def _release_req_tid(self, req_id: ReqId, end_ns: int) -> None:
+        tid = self._req_profile_tid.pop(req_id, None)
+        if tid is not None:
+            slot = int(tid.split("_")[1])
+            self._req_profile_slot_end_ns[slot] = end_ns
+
+    def get_req_profile_tid(self, req_id: ReqId) -> str | None:
+        return self._req_profile_tid.get(req_id)
+
+    def set_req_profile_tids(self, tid_map: dict) -> None:
+        self._req_profile_tid.update(tid_map)
 
     def _register_handlers(
         self,
@@ -620,19 +665,26 @@ class OffloadingConnectorWorker:
         self._register_handlers(kv_caches, attn_backends)
 
     def handle_preemptions(self, preempted_req_ids: set[str]):
-        for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
-            assert success
-        self._unsubmitted_store_jobs.clear()
+        step = self._profile_step
+        self._profile_step += 1
+        with profile_scope(f"handle_preemptions(step={step})"):
+            for job_id, transfer_spec in self._unsubmitted_store_jobs:
+                success = self.worker.transfer_async(job_id, transfer_spec)
+                assert success
+            self._unsubmitted_store_jobs.clear()
 
-        for req_id in preempted_req_ids:
-            job_ids = self._store_jobs.get(req_id)
-            if job_ids:
-                self.worker.wait(job_ids)
+            for req_id in preempted_req_ids:
+                job_ids = self._store_jobs.get(req_id)
+                if job_ids:
+                    self.worker.wait(job_ids)
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
+        self._profile_step += 1
         for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            success = self.worker.transfer_async(job_id, transfer_spec)
+            req_id, _ = self._jobs[job_id]
+            tid = self._req_profile_tid.get(req_id, "kv_store")
+            success = self.worker.transfer_async(job_id, transfer_spec,
+                                                profile_tid=tid, req_id=req_id)
             assert success
         self._unsubmitted_store_jobs.clear()
 
@@ -641,7 +693,11 @@ class OffloadingConnectorWorker:
             self._jobs[job_id] = (req_id, False)
             assert req_id not in self._load_job
             self._load_job[req_id] = job_id
-            success = self.worker.transfer_async(job_id, transfer_spec)
+            load_start_ns = time.perf_counter_ns()
+            self._load_submit_time_ns[job_id] = load_start_ns
+            tid = self._get_or_alloc_req_tid(req_id, load_start_ns)
+            success = self.worker.transfer_async(job_id, transfer_spec,
+                                                profile_tid=tid, req_id=req_id)
             assert success
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
@@ -652,6 +708,9 @@ class OffloadingConnectorWorker:
             # NOTE(orozery): defer the store to the beginning of the next engine step,
             # so that offloading starts AFTER transfers related to token sampling,
             # thereby avoiding delays to token generation due to offloading.
+            start_ns = time.perf_counter_ns()
+            self._store_queue_time_ns[job_id] = start_ns
+            self._get_or_alloc_req_tid(req_id, start_ns)
             self._unsubmitted_store_jobs.append((job_id, transfer_spec))
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
@@ -671,6 +730,30 @@ class OffloadingConnectorWorker:
             job_id = transfer_result.job_id
             assert transfer_result.success
             req_id, store = self._jobs.pop(job_id)
+            now_ns = time.perf_counter_ns()
+            tid = self._req_profile_tid.get(req_id, "kv_transfer")
+            if store:
+                queue_time_ns = self._store_queue_time_ns.pop(job_id, None)
+                if queue_time_ns is not None:
+                    profiler.add_event(
+                        name=f"save_e2e(job={job_id})",
+                        category="kv_offload",
+                        start_ns=queue_time_ns,
+                        duration_ns=now_ns - queue_time_ns,
+                        tid=tid,
+                        args={"req_id": req_id},
+                    )
+            else:
+                submit_time_ns = self._load_submit_time_ns.pop(job_id, None)
+                if submit_time_ns is not None:
+                    profiler.add_event(
+                        name=f"load_e2e(job={job_id})",
+                        category="kv_offload",
+                        start_ns=submit_time_ns,
+                        duration_ns=now_ns - submit_time_ns,
+                        tid=tid,
+                        args={"req_id": req_id},
+                    )
             if (
                 transfer_result.transfer_time
                 and transfer_result.transfer_size is not None
@@ -691,11 +774,13 @@ class OffloadingConnectorWorker:
                     self._finished_reqs_waiting_for_store.remove(req_id)
                     finished_sending.add(req_id)
                     del self._store_jobs[req_id]
+                    self._release_req_tid(req_id, now_ns)
             else:
                 req_job = self._load_job[req_id]
                 assert job_id == req_job
                 del self._load_job[req_id]
                 finished_recving.add(req_id)
+                self._release_req_tid(req_id, now_ns)
 
         for req_id in finished_req_ids:
             pending_req_jobs = self._store_jobs.get(req_id)

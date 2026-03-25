@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections import deque
 from dataclasses import dataclass
 
@@ -17,6 +18,8 @@ from vllm.v1.kv_offload.worker.worker import (
     TransferSpec,
 )
 
+from simple_profiler import profile_scope, profiler
+
 logger = init_logger(__name__)
 
 
@@ -27,6 +30,9 @@ class Transfer:
     start_event: torch.Event
     end_event: torch.Event
     num_bytes: int
+    wall_start_ns: int
+    profile_tid: str = "kv_transfer"
+    req_id: str = ""
 
 
 def expand_block_ids(
@@ -116,7 +122,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         # list of CUDA events available for re-use
         self._event_pool: list[torch.Event] = []
 
-    def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
+    def transfer_async(self, job_id: int, transfer_spec: TransferSpec,
+                       profile_tid: str = "kv_transfer",
+                       req_id: str = "") -> bool:
         src_spec, dst_spec = transfer_spec
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
@@ -154,6 +162,8 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             else torch.Event(enable_timing=True)
         )
 
+        wall_start_ns = time.perf_counter_ns()
+
         if self.gpu_to_cpu:
             # wait for model computation to finish before offloading
             stream.wait_stream(torch.cuda.current_stream())
@@ -185,6 +195,9 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 start_event=start_event,
                 end_event=end_event,
                 num_bytes=dst_sub_block_count * self.total_block_size_in_bytes,
+                wall_start_ns=wall_start_ns,
+                profile_tid=profile_tid,
+                req_id=req_id,
             )
         )
 
@@ -198,6 +211,27 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
             transfer_time = (
                 transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
             )  # elapsed_time is in milliseconds
+            end_ns = time.perf_counter_ns()
+            duration_ns = int(transfer_time * 1e9)
+            direction = 'gpu_to_cpu' if self.gpu_to_cpu else 'cpu_to_gpu'
+            job_args = {"num_bytes": transfer.num_bytes, "req_id": transfer.req_id}
+            profiler.add_event(
+                name=f"cuda_transfer({direction}, job={transfer.job_id})",
+                category="cuda",
+                start_ns=transfer.wall_start_ns,
+                duration_ns=duration_ns,
+                tid=transfer.profile_tid,
+                args=job_args,
+            )
+            # Wall-clock span from CUDA submission to completion detection
+            profiler.add_event(
+                name=f"transfer_e2e({direction}, job={transfer.job_id})",
+                category="kv_offload",
+                start_ns=transfer.wall_start_ns,
+                duration_ns=end_ns - transfer.wall_start_ns,
+                tid=transfer.profile_tid,
+                args=job_args,
+            )
             result = TransferResult(
                 job_id=transfer.job_id,
                 success=True,
@@ -217,7 +251,8 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         for job_id in job_ids:
             event = self._transfer_events.get(job_id)
             if event is not None:
-                event.synchronize()
+                with profile_scope(f"event_sync(job={job_id})", "kv_offload"):
+                    event.synchronize()
 
 
 class CpuGpuOffloadingHandlers:

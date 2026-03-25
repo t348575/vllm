@@ -3,6 +3,8 @@
 
 import functools
 import gc
+
+from simple_profiler import profile_gpu_scope
 import itertools
 import threading
 import time
@@ -381,6 +383,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    profile_step: int = 0
 
 
 class GPUModelRunner(
@@ -402,6 +405,8 @@ class GPUModelRunner(
         self.scheduler_config = vllm_config.scheduler_config
         self.speculative_config = vllm_config.speculative_config
         self.observability_config = vllm_config.observability_config
+        self._profile_step = 0
+        self._profile_req_tid: dict[str, str] = {}  # req_id -> "req_N" (set by EngineCore)
 
         model_config = self.model_config
         cache_config = self.cache_config
@@ -1030,6 +1035,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self._profile_req_tid.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1126,6 +1132,12 @@ class GPUModelRunner(
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
+
+            if (req_id not in self._profile_req_tid
+                    and scheduler_output.req_profile_tids):
+                tid = scheduler_output.req_profile_tids.get(req_id)
+                if tid:
+                    self._profile_req_tid[req_id] = tid
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -3539,6 +3551,8 @@ class GPUModelRunner(
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
+        step = self._profile_step
+        self._profile_step += 1
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -3766,6 +3780,9 @@ class GPUModelRunner(
         # When spec decode is enabled, defer connector finalization
         # (wait_for_save + clear metadata) until after draft model runs.
         defer_kv_connector_finalize = self.speculative_config is not None
+        _active_tids = [(self._profile_req_tid[r], {"req_id": r})
+                        for r in scheduler_output.num_scheduled_tokens
+                        if r in self._profile_req_tid]
         with (
             set_forward_context(
                 attn_metadata,
@@ -3781,16 +3798,19 @@ class GPUModelRunner(
             record_function_or_nullcontext("gpu_model_runner: forward"),
             self.maybe_get_kv_connector_output(
                 scheduler_output,
+                req_profile_tids=self._profile_req_tid,
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
-            )
+            with profile_gpu_scope(f"forward(step={step})", "model",
+                                   tids=_active_tids or None):
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -3862,6 +3882,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            profile_step=step
         )
         self.kv_connector_output = kv_connector_output
         return None
@@ -3900,6 +3921,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            step
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -3910,7 +3932,10 @@ class GPUModelRunner(
                 scheduler_output, grammar_output, self.input_batch, logits
             )
 
-        with record_function_or_nullcontext("gpu_model_runner: sample"):
+        _sample_tids = [(self._profile_req_tid[r], {"req_id": r})
+                        for r in scheduler_output.num_scheduled_tokens
+                        if r in self._profile_req_tid]
+        with record_function_or_nullcontext("gpu_model_runner: sample"), profile_gpu_scope(f"sample(step={step})","model", tids=_sample_tids or None):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         self._update_states_after_model_execute(

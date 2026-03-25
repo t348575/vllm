@@ -67,11 +67,12 @@ class KVConnectorModelRunnerMixin:
     @staticmethod
     def maybe_get_kv_connector_output(
         scheduler_output: "SchedulerOutput",
+        req_profile_tids: "dict[str, str] | None" = None,
         defer_finalize: bool = False,
     ) -> AbstractContextManager[KVConnectorOutput | None]:
         return (
             KVConnectorModelRunnerMixin._get_kv_connector_output(
-                scheduler_output, defer_finalize=defer_finalize
+                scheduler_output, req_profile_tids=req_profile_tids, defer_finalize=defer_finalize
             )
             if has_kv_transfer_group()
             else nullcontext()
@@ -95,6 +96,7 @@ class KVConnectorModelRunnerMixin:
     def _get_kv_connector_output(
         scheduler_output: "SchedulerOutput",
         wait_for_save: bool = True,
+        req_profile_tids: "dict[str, str] | None" = None,
         defer_finalize: bool = False,
     ) -> Generator[KVConnectorOutput, None, None]:
         output = KVConnectorOutput()
@@ -104,6 +106,11 @@ class KVConnectorModelRunnerMixin:
         assert isinstance(kv_connector, KVConnectorBase)
         assert scheduler_output.kv_connector_metadata is not None
         kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+
+        # Push model-runner-side request TIDs into the connector so KV events
+        # appear on the correct per-request tracks.
+        if req_profile_tids and hasattr(kv_connector, "set_req_profile_tids"):
+            kv_connector.set_req_profile_tids(req_profile_tids)
 
         # Background KV cache transfers happen here.
         # These transfers are designed to be async and the requests

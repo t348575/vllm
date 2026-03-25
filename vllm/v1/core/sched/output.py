@@ -230,6 +230,9 @@ class SchedulerOutput:
     # KV Cache Connector metadata.
     kv_connector_metadata: KVConnectorMetadata | None = None
 
+    # Profiling: req_id -> TID string for trace viewer (set by EngineCore)
+    req_profile_tids: dict[str, str] | None = None
+
     # EC Cache Connector metadata
     ec_connector_metadata: ECConnectorMetadata | None = None
 
