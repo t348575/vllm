@@ -33,7 +33,7 @@ def main():
         vllm.entrypoints.cli.run_batch,
     ]
 
-    profiler.begin_session("results.json")
+    profiler.begin_session("results.json", merge_output="merge.json")
 
     cli_env_setup()
 

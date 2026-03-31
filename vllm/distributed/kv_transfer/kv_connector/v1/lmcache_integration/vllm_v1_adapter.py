@@ -617,7 +617,7 @@ class LMCacheConnectorV1Impl:
         else:
             from simple_profiler import profiler as _profiler
             _tp_rank = get_tensor_model_parallel_rank()
-            _profiler.begin_session(f"results_worker{_tp_rank}.json")
+            _profiler.begin_session(f"results_worker{_tp_rank}.json", merge_output="merge.json")
 
             self.lmcache_engine = _init_lmcache_engine(
                 config,

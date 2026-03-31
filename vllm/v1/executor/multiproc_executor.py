@@ -778,7 +778,7 @@ class WorkerProc:
         This runs a background process"""
 
         from simple_profiler import profiler as _simple_profiler
-        _simple_profiler.begin_session(f"results_vllm_worker{kwargs.get('rank', 0)}.json")
+        _simple_profiler.begin_session(f"results_vllm_worker{kwargs.get('rank', 0)}.json", merge_output="merge.json")
 
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker

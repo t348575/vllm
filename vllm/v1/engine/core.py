@@ -1080,7 +1080,7 @@ class EngineCoreProc(EngineCore):
         """Launch EngineCore busy loop in background process."""
 
         from simple_profiler import profiler
-        profiler.begin_session(f"results_engine_core_{dp_rank}.json")
+        profiler.begin_session(f"results_engine_core_{dp_rank}.json", merge_output="merge.json")
 
         # Ensure we can serialize transformer config after spawning
         maybe_register_config_serialize_by_value()
