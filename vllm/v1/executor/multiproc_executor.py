@@ -425,12 +425,9 @@ class MultiprocExecutor(Executor):
         for p in active_procs():
             p.terminate()
         if not wait_for_termination(active_procs(), 4):
-            # Send SIGKILL if still running
-            logger.debug(
-                "Worker Termination: resorting to SIGKILL to take down workers"
+            logger.warning(
+                "Worker Termination: workers still running after SIGTERM timeout; skipping SIGKILL to allow clean shutdown"
             )
-            for p in active_procs():
-                p.kill()
 
     def shutdown(self):
         """Properly shut down the executor and its workers"""
@@ -778,7 +775,11 @@ class WorkerProc:
         This runs a background process"""
 
         from simple_profiler import profiler as _simple_profiler
-        _simple_profiler.begin_session(f"results_vllm_worker{kwargs.get('rank', 0)}.json", merge_output="merge.json")
+
+        _simple_profiler.begin_session(
+            f"results_vllm_worker{kwargs.get('rank', 0)}.json",
+            merge_output="merge.json",
+        )
 
         # Signal handler used for graceful termination.
         # SystemExit exception is only raised once to allow this and worker
@@ -864,7 +865,7 @@ class WorkerProc:
             shutdown_requested.set()
 
         except SystemExit as e:
-            # SystemExit is raised on SIGTERM or SIGKILL, which usually indicates that
+            # SystemExit is raised on SIGTERM, which usually indicates that
             # the graceful shutdown process did not succeed
             logger.warning("WorkerProc was terminated")
             # SystemExit must never be ignored
@@ -878,6 +879,7 @@ class WorkerProc:
             # Clean up once worker exits busy loop
             if worker is not None:
                 worker.shutdown()
+            _simple_profiler.end_session()
 
     class ResponseStatus(Enum):
         SUCCESS = auto()

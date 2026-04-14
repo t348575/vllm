@@ -26,7 +26,6 @@ import vllm.envs as envs
 from vllm.logger import init_logger
 from vllm.usage.usage_lib import UsageContext, is_usage_stats_enabled, usage_message
 from vllm.utils.network_utils import get_open_port, get_open_zmq_ipc_path, get_tcp_uri
-from vllm.utils.system_utils import kill_process_tree
 from vllm.v1.core.sched.output import SchedulerOutput
 
 if TYPE_CHECKING:
@@ -307,13 +306,24 @@ def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
     # Allow at least 5 seconds for remaining procs to terminate.
     timeout = max(timeout, 5.0)
 
-    # Shutdown the process.
+    # First give processes a chance to exit on their own. In the CLI serve
+    # path they may have already received SIGINT/SIGTERM directly and be in
+    # the middle of graceful teardown (including profiler flush/merge).
+    deadline = time.monotonic() + timeout
+    for proc in procs:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        if proc.is_alive():
+            proc.join(remaining)
+
+    # Send SIGTERM to any process still alive after the grace period.
     for proc in procs:
         if proc.is_alive():
             proc.terminate()
 
-    # Allow time for remaining procs to terminate.
-    deadline = time.monotonic() + timeout
+    # Allow a short post-SIGTERM interval for remaining procs to terminate.
+    deadline = time.monotonic() + min(timeout, 1.0)
     for proc in procs:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -323,7 +333,11 @@ def shutdown(procs: list[BaseProcess], timeout: float | None = None) -> None:
 
     for proc in procs:
         if proc.is_alive() and (pid := proc.pid) is not None:
-            kill_process_tree(pid)
+            logger.warning(
+                "Process %s (PID: %s) is still alive after SIGTERM timeout; skipping force kill to allow clean shutdown",
+                proc.name,
+                pid,
+            )
 
 
 def copy_slice(

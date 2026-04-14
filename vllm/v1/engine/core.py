@@ -1080,7 +1080,10 @@ class EngineCoreProc(EngineCore):
         """Launch EngineCore busy loop in background process."""
 
         from simple_profiler import profiler
-        profiler.begin_session(f"results_engine_core_{dp_rank}.json", merge_output="merge.json")
+
+        profiler.begin_session(
+            f"results_engine_core_{dp_rank}.json", merge_output="merge.json"
+        )
 
         # Ensure we can serialize transformer config after spawning
         maybe_register_config_serialize_by_value()
@@ -1161,6 +1164,7 @@ class EngineCoreProc(EngineCore):
                 signal_callback.stop()
             if engine_core is not None:
                 engine_core.shutdown()
+            profiler.end_session()
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass
