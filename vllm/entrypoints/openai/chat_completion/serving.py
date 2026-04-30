@@ -13,6 +13,7 @@ import partial_json_parser
 import regex as re
 from fastapi import Request
 from partial_json_parser.core.options import Allow
+from simple_profiler import profile_scope, profiler
 
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
@@ -194,7 +195,8 @@ class OpenAIServingChat(OpenAIServing):
             A tuple of (conversation, engine_inputs) on success,
             or an ErrorResponse on failure.
         """
-        error_check_ret = await self._check_model(request)
+        with profile_scope("openai.chat.check_model", "api"):
+            error_check_ret = await self._check_model(request)
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
             return error_check_ret
@@ -205,7 +207,8 @@ class OpenAIServingChat(OpenAIServing):
         if self.engine_client.errored:
             raise self.engine_client.dead_error
 
-        return await self.openai_serving_render.render_chat(request)
+        with profile_scope("openai.chat.render_chat", "api"):
+            return await self.openai_serving_render.render_chat(request)
 
     async def create_chat_completion(
         self,
@@ -219,19 +222,21 @@ class OpenAIServingChat(OpenAIServing):
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
         """
+        create_start_ns = time.perf_counter_ns() if profiler._active else None
         # Streaming response
         tokenizer = self.renderer.tokenizer
         assert tokenizer is not None
-        chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
-            request.chat_template_kwargs,
-            self.default_chat_template_kwargs,
-        )
-        reasoning_parser: ReasoningParser | None = None
-        if self.reasoning_parser_cls:
-            reasoning_parser = self.reasoning_parser_cls(
-                tokenizer,
-                chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
+        with profile_scope("openai.chat.prepare_template_kwargs", "api"):
+            chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
+                request.chat_template_kwargs,
+                self.default_chat_template_kwargs,
             )
+            reasoning_parser: ReasoningParser | None = None
+            if self.reasoning_parser_cls:
+                reasoning_parser = self.reasoning_parser_cls(
+                    tokenizer,
+                    chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
+                )
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
@@ -242,16 +247,19 @@ class OpenAIServingChat(OpenAIServing):
             f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
         )
 
-        request_metadata = RequestResponseMetadata(request_id=request_id)
-        if raw_request:
-            raw_request.state.request_metadata = request_metadata
+        with profile_scope("openai.chat.request_setup", "api"):
+            request_metadata = RequestResponseMetadata(request_id=request_id)
+            if raw_request:
+                raw_request.state.request_metadata = request_metadata
 
-        lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
+            lora_request = self._maybe_get_adapters(
+                request, supports_default_mm_loras=True
+            )
 
-        model_name = self.models.model_name(lora_request)
+            model_name = self.models.model_name(lora_request)
 
-        # Extract data_parallel_rank from header (router can inject it)
-        data_parallel_rank = self._get_data_parallel_rank(raw_request)
+            # Extract data_parallel_rank from header (router can inject it)
+            data_parallel_rank = self._get_data_parallel_rank(raw_request)
 
         # Schedule the request and get the result generator.
         max_model_len = self.model_config.max_model_len
@@ -265,39 +273,46 @@ class OpenAIServingChat(OpenAIServing):
                 request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
             )
 
-            max_tokens = get_max_tokens(
-                max_model_len,
-                request.max_completion_tokens
-                if request.max_completion_tokens is not None
-                else request.max_tokens,
-                self._extract_prompt_len(engine_input),
-                self.default_sampling_params,
-                self.override_max_tokens,
-            )
-
-            sampling_params: SamplingParams | BeamSearchParams
-            if request.use_beam_search:
-                sampling_params = request.to_beam_search_params(
-                    max_tokens, self.default_sampling_params
-                )
-            else:
-                sampling_params = request.to_sampling_params(
-                    max_tokens,
+            with profile_scope(
+                "openai.chat.build_sampling_params",
+                "api",
+                args={"prompt_tokens": len(prompt_token_ids or [])},
+            ):
+                max_tokens = get_max_tokens(
+                    max_model_len,
+                    request.max_completion_tokens
+                    if request.max_completion_tokens is not None
+                    else request.max_tokens,
+                    self._extract_prompt_len(engine_input),
                     self.default_sampling_params,
+                    self.override_max_tokens,
                 )
 
-            self._log_inputs(
-                sub_request_id,
-                engine_input,
-                params=sampling_params,
-                lora_request=lora_request,
-            )
+                sampling_params: SamplingParams | BeamSearchParams
+                if request.use_beam_search:
+                    sampling_params = request.to_beam_search_params(
+                        max_tokens, self.default_sampling_params
+                    )
+                else:
+                    sampling_params = request.to_sampling_params(
+                        max_tokens,
+                        self.default_sampling_params,
+                    )
 
-            trace_headers = (
-                None
-                if raw_request is None
-                else await self._get_trace_headers(raw_request.headers)
-            )
+            with profile_scope("openai.chat.log_inputs", "api"):
+                self._log_inputs(
+                    sub_request_id,
+                    engine_input,
+                    params=sampling_params,
+                    lora_request=lora_request,
+                )
+
+            with profile_scope("openai.chat.trace_headers", "api"):
+                trace_headers = (
+                    None
+                    if raw_request is None
+                    else await self._get_trace_headers(raw_request.headers)
+                )
 
             if isinstance(sampling_params, BeamSearchParams):
                 generator = self.beam_search(
@@ -317,21 +332,31 @@ class OpenAIServingChat(OpenAIServing):
                 else:
                     reasoning_ended = None
 
-                generator = self.engine_client.generate(
-                    engine_input,
-                    sampling_params,
-                    sub_request_id,
-                    lora_request=lora_request,
-                    trace_headers=trace_headers,
-                    priority=request.priority,
-                    data_parallel_rank=data_parallel_rank,
-                    reasoning_ended=reasoning_ended,
-                )
+                with profile_scope("openai.chat.create_engine_generator", "api"):
+                    generator = self.engine_client.generate(
+                        engine_input,
+                        sampling_params,
+                        sub_request_id,
+                        lora_request=lora_request,
+                        trace_headers=trace_headers,
+                        priority=request.priority,
+                        data_parallel_rank=data_parallel_rank,
+                        reasoning_ended=reasoning_ended,
+                    )
 
             generators.append(generator)
 
         assert len(generators) == 1
         (result_generator,) = generators
+
+        if create_start_ns is not None:
+            profiler.add_event(
+                "openai.chat.create_chat_completion",
+                "api",
+                create_start_ns,
+                time.perf_counter_ns() - create_start_ns,
+                args={"stream": bool(request.stream)},
+            )
 
         if request.stream:
             return self.chat_completion_stream_generator(
@@ -516,6 +541,9 @@ class OpenAIServingChat(OpenAIServing):
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
         first_iteration = True
+        stream_start_ns = time.perf_counter_ns() if profiler._active else None
+        first_engine_output_seen = False
+        first_content_chunk_seen = False
 
         # Send response for each token for each request.n (index)
         num_choices = 1 if request.n is None else request.n
@@ -591,6 +619,15 @@ class OpenAIServingChat(OpenAIServing):
 
         try:
             async for res in result_generator:
+                if stream_start_ns is not None and not first_engine_output_seen:
+                    first_engine_output_seen = True
+                    profiler.add_event(
+                        "openai.chat.stream.wait_first_engine_output",
+                        "api",
+                        stream_start_ns,
+                        time.perf_counter_ns() - stream_start_ns,
+                        args={"request_id": request_id},
+                    )
                 if res.prompt_token_ids is not None:
                     num_prompt_tokens = len(res.prompt_token_ids)
                     if res.encoder_prompt_token_ids is not None:
@@ -1116,6 +1153,19 @@ class OpenAIServingChat(OpenAIServing):
                         )
 
                     data = chunk.model_dump_json(exclude_unset=True)
+                    if (
+                        stream_start_ns is not None
+                        and not first_content_chunk_seen
+                        and delta_message.content
+                    ):
+                        first_content_chunk_seen = True
+                        profiler.add_event(
+                            "openai.chat.stream.first_content_chunk",
+                            "api",
+                            stream_start_ns,
+                            time.perf_counter_ns() - stream_start_ns,
+                            args={"request_id": request_id},
+                        )
                     yield f"data: {data}\n\n"
 
             # once the final token is handled, if stream_options.include_usage

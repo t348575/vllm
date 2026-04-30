@@ -6,6 +6,7 @@ from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from simple_profiler import profile_scope
 
 from vllm.entrypoints.openai.chat_completion.batch_serving import OpenAIServingChatBatch
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -51,14 +52,19 @@ def batch_chat(request: Request) -> OpenAIServingChatBatch | None:
 @with_cancellation
 @load_aware_call
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
-    metrics_header_format = raw_request.headers.get(
-        ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, ""
-    )
-    handler = chat(raw_request)
-    if handler is None:
-        raise NotImplementedError("The model does not support Chat Completions API")
+    with profile_scope(
+        "openai.chat.route_handler",
+        "api",
+        args={"stream": bool(request.stream)},
+    ):
+        metrics_header_format = raw_request.headers.get(
+            ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, ""
+        )
+        handler = chat(raw_request)
+        if handler is None:
+            raise NotImplementedError("The model does not support Chat Completions API")
 
-    generator = await handler.create_chat_completion(request, raw_request)
+        generator = await handler.create_chat_completion(request, raw_request)
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(

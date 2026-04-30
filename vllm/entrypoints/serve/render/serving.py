@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Sequence
 from http import HTTPStatus
 from typing import Any
 
 from openai_harmony import Message as OpenAIMessage
+from simple_profiler import profile_scope, profiler
 
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
@@ -58,6 +60,19 @@ from vllm.utils.mistral import is_mistral_tokenizer
 from vllm.utils.mistral import mt as _mt
 
 logger = init_logger(__name__)
+
+
+def _message_content_chars(messages: Sequence[Any]) -> int:
+    total = 0
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and isinstance(part.get("text"), str):
+                    total += len(part["text"])
+    return total
 
 
 class OpenAIServingRender:
@@ -188,6 +203,10 @@ class OpenAIServingRender:
         Called directly by render_chat_request and delegated to by
         OpenAIServingChat.render_chat_request after its engine-aware checks.
         """
+        render_start_ns = None
+        if profiler._active:
+            render_start_ns = time.perf_counter_ns()
+
         tokenizer = self.renderer.tokenizer
 
         tool_parser = self.tool_parser
@@ -234,29 +253,48 @@ class OpenAIServingRender:
 
         if not self.use_harmony:
             # Common case.
-            error_check_ret = self.validate_chat_template(
-                request_chat_template=request.chat_template,
-                chat_template_kwargs=request.chat_template_kwargs,
-                trust_request_chat_template=self.trust_request_chat_template,
-            )
+            with profile_scope("openai.render_chat.validate_template", "api"):
+                error_check_ret = self.validate_chat_template(
+                    request_chat_template=request.chat_template,
+                    chat_template_kwargs=request.chat_template_kwargs,
+                    trust_request_chat_template=self.trust_request_chat_template,
+                )
             if error_check_ret is not None:
                 return error_check_ret
 
-            conversation, engine_inputs = await self.preprocess_chat(
-                request,
-                request.messages,
-                default_template=self.chat_template,
-                default_template_content_format=self.chat_template_content_format,
-                default_template_kwargs=self.default_chat_template_kwargs,
-                tool_dicts=tool_dicts,
-                tool_parser=tool_parser,
-                reasoning_parser=self.reasoning_parser,
-            )
+            with profile_scope(
+                "openai.render_chat.preprocess_chat",
+                "api",
+                args={
+                    "num_messages": len(request.messages),
+                    "message_content_chars": _message_content_chars(request.messages),
+                },
+            ):
+                conversation, engine_inputs = await self.preprocess_chat(
+                    request,
+                    request.messages,
+                    default_template=self.chat_template,
+                    default_template_content_format=self.chat_template_content_format,
+                    default_template_kwargs=self.default_chat_template_kwargs,
+                    tool_dicts=tool_dicts,
+                    tool_parser=tool_parser,
+                    reasoning_parser=self.reasoning_parser,
+                )
         else:
             # For GPT-OSS.
             should_include_tools = tool_dicts is not None
-            conversation, engine_inputs = self._make_request_with_harmony(
-                request, should_include_tools
+            with profile_scope("openai.render_chat.harmony", "api"):
+                conversation, engine_inputs = self._make_request_with_harmony(
+                    request, should_include_tools
+                )
+
+        if render_start_ns is not None:
+            profiler.add_event(
+                "openai.render_chat.total",
+                "api",
+                render_start_ns,
+                time.perf_counter_ns() - render_start_ns,
+                args={"num_engine_inputs": len(engine_inputs)},
             )
 
         return conversation, engine_inputs
@@ -517,38 +555,48 @@ class OpenAIServingRender:
         renderer = self.renderer
         mm_config = self.model_config.multimodal_config
 
-        default_template_kwargs = merge_kwargs(
-            default_template_kwargs,
-            dict(
-                tools=tool_dicts,
-                tokenize=is_mistral_tokenizer(renderer.tokenizer),
-            ),
-        )
+        with profile_scope("openai.preprocess_chat.build_params", "api"):
+            default_template_kwargs = merge_kwargs(
+                default_template_kwargs,
+                dict(
+                    tools=tool_dicts,
+                    tokenize=is_mistral_tokenizer(renderer.tokenizer),
+                ),
+            )
 
-        tok_params = request.build_tok_params(self.model_config)
-        chat_params = request.build_chat_params(
-            default_template, default_template_content_format
-        ).with_defaults(
-            default_template_kwargs,
-            default_media_io_kwargs=(mm_config.media_io_kwargs if mm_config else None),
-            default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
-        )
+            tok_params = request.build_tok_params(self.model_config)
+            chat_params = request.build_chat_params(
+                default_template, default_template_content_format
+            ).with_defaults(
+                default_template_kwargs,
+                default_media_io_kwargs=(mm_config.media_io_kwargs if mm_config else None),
+                default_mm_processor_kwargs=getattr(request, "mm_processor_kwargs", None),
+            )
 
-        (conversation,), (engine_input,) = await renderer.render_chat_async(
-            [messages],
-            chat_params,
-            tok_params,
-            prompt_extras={
-                k: v
-                for k in ("mm_processor_kwargs", "cache_salt")
-                if (v := getattr(request, k, None)) is not None
+        with profile_scope(
+            "openai.preprocess_chat.render_chat_async",
+            "api",
+            args={
+                "num_messages": len(messages),
+                "message_content_chars": _message_content_chars(messages),
             },
-            skip_mm_cache=skip_mm_cache,
-        )
+        ):
+            (conversation,), (engine_input,) = await renderer.render_chat_async(
+                [messages],
+                chat_params,
+                tok_params,
+                prompt_extras={
+                    k: v
+                    for k in ("mm_processor_kwargs", "cache_salt")
+                    if (v := getattr(request, k, None)) is not None
+                },
+                skip_mm_cache=skip_mm_cache,
+            )
 
         if reasoning_parser is not None:
-            tokenizer = renderer.get_tokenizer()
-            request = reasoning_parser(tokenizer).adjust_request(request=request)
+            with profile_scope("openai.preprocess_chat.reasoning_adjust", "api"):
+                tokenizer = renderer.get_tokenizer()
+                request = reasoning_parser(tokenizer).adjust_request(request=request)
 
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser
@@ -563,9 +611,10 @@ class OpenAIServingRender:
                         f"but got {type(request).__name__}"
                     )
                     raise NotImplementedError(msg)
-                tokenizer = renderer.get_tokenizer()
-                request = tool_parser(tokenizer, request.tools).adjust_request(
-                    request=request
-                )
+                with profile_scope("openai.preprocess_chat.tool_adjust", "api"):
+                    tokenizer = renderer.get_tokenizer()
+                    request = tool_parser(tokenizer, request.tools).adjust_request(
+                        request=request
+                    )
 
         return conversation, [engine_input]

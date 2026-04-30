@@ -10,6 +10,7 @@ from copy import copy
 from typing import Any
 
 import torch
+from simple_profiler import profile_scope, profiler
 
 import vllm.envs as envs
 from vllm import TokensPrompt
@@ -298,6 +299,8 @@ class AsyncLLM(EngineClient):
     ) -> RequestOutputCollector:
         """Add new request to the AsyncLLM."""
 
+        add_request_start_ns = time.perf_counter_ns() if profiler._active else None
+
         if self.errored:
             raise EngineDeadError()
 
@@ -347,19 +350,23 @@ class AsyncLLM(EngineClient):
                     "latter will be used, and the former will be ignored."
                 )
         else:
-            request = self.input_processor.process_inputs(
-                request_id,
-                prompt,
-                params,
-                supported_tasks=await self.get_supported_tasks(),
-                arrival_time=arrival_time,
-                lora_request=lora_request,
-                tokenization_kwargs=tokenization_kwargs,
-                trace_headers=trace_headers,
-                priority=priority,
-                data_parallel_rank=data_parallel_rank,
-            )
-            prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+            with profile_scope("async_llm.get_supported_tasks", "api"):
+                supported_tasks = await self.get_supported_tasks()
+            with profile_scope("async_llm.process_inputs", "api"):
+                request = self.input_processor.process_inputs(
+                    request_id,
+                    prompt,
+                    params,
+                    supported_tasks=supported_tasks,
+                    arrival_time=arrival_time,
+                    lora_request=lora_request,
+                    tokenization_kwargs=tokenization_kwargs,
+                    trace_headers=trace_headers,
+                    priority=priority,
+                    data_parallel_rank=data_parallel_rank,
+                )
+            with profile_scope("async_llm.extract_prompt_components", "api"):
+                prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
 
         if reasoning_ended is not None:
             request.reasoning_ended = reasoning_ended
@@ -379,6 +386,17 @@ class AsyncLLM(EngineClient):
 
         if is_pooling or params.n == 1:
             await self._add_request(request, prompt_text, None, 0, queue)
+            if add_request_start_ns is not None:
+                profiler.add_event(
+                    "async_llm.add_request",
+                    "api",
+                    add_request_start_ns,
+                    time.perf_counter_ns() - add_request_start_ns,
+                    args={
+                        "request_id": request.request_id,
+                        "prompt_tokens": len(request.prompt_token_ids or []),
+                    },
+                )
             return queue
 
         parent_params = params
@@ -394,6 +412,14 @@ class AsyncLLM(EngineClient):
             await self._add_request(
                 child_request, prompt_text, parent_request, idx, queue
             )
+        if add_request_start_ns is not None:
+            profiler.add_event(
+                "async_llm.add_request",
+                "api",
+                add_request_start_ns,
+                time.perf_counter_ns() - add_request_start_ns,
+                args={"request_id": request.request_id},
+            )
         return queue
 
     async def _add_request(
@@ -405,10 +431,23 @@ class AsyncLLM(EngineClient):
         queue: RequestOutputCollector,
     ):
         # Add the request to OutputProcessor (this process).
-        self.output_processor.add_request(request, prompt, parent_req, index, queue)
+        with profile_scope(
+            "async_llm.output_processor.add_request",
+            "api",
+            args={"request_id": request.request_id},
+        ):
+            self.output_processor.add_request(request, prompt, parent_req, index, queue)
 
         # Add the EngineCoreRequest to EngineCore (separate process).
-        await self.engine_core.add_request_async(request)
+        with profile_scope(
+            "async_llm.engine_core.add_request_async",
+            "api",
+            args={
+                "request_id": request.request_id,
+                "prompt_tokens": len(request.prompt_token_ids or []),
+            },
+        ):
+            await self.engine_core.add_request_async(request)
 
         if self.log_requests:
             logger.info("Added request %s.", request.request_id)
