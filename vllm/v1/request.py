@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+from simple_profiler import profiler
 
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
@@ -213,7 +214,22 @@ class Request:
     def update_block_hashes(self) -> None:
         """Compute block hashes for any new full blocks and append them."""
         if self._block_hasher is not None:
-            self.block_hashes.extend(self._block_hasher(self))
+            start_ns = time.perf_counter_ns()
+            new_hashes = self._block_hasher(self)
+            self.block_hashes.extend(new_hashes)
+            if profiler._active and new_hashes:
+                profiler.add_event(
+                    "request.update_block_hashes",
+                    "prefix_cache",
+                    start_ns,
+                    time.perf_counter_ns() - start_ns,
+                    args={
+                        "req_id": self.request_id,
+                        "num_tokens": self.num_tokens,
+                        "new_hashes": len(new_hashes),
+                        "total_hashes": len(self.block_hashes),
+                    },
+                )
 
     @property
     def use_structured_output(self) -> bool:

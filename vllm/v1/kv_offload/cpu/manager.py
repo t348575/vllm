@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import time
 from collections.abc import Iterable
 from typing import Literal
+
+from simple_profiler import profiler
 
 from vllm.v1.kv_offload.abstract import (
     LoadStoreSpec,
@@ -86,23 +89,46 @@ class CPUOffloadingManager(OffloadingManager):
     # --- OffloadingManager interface ---
 
     def lookup(self, keys: Iterable[OffloadKey]) -> int | None:
+        start_ns = time.perf_counter_ns()
         hit_count = 0
+        checked = 0
         for key in keys:
+            checked += 1
             block = self._policy.get(key)
             if block is None or not block.is_ready:
                 break
             hit_count += 1
+        if profiler._active:
+            profiler.add_event(
+                "cpu_offload_manager.lookup",
+                "kv_offload",
+                start_ns,
+                time.perf_counter_ns() - start_ns,
+                args={"checked_keys": checked, "hit_count": hit_count},
+            )
         return hit_count
 
     def prepare_load(self, keys: Iterable[OffloadKey]) -> LoadStoreSpec:
+        start_ns = time.perf_counter_ns()
         blocks = []
+        key_count = 0
         for key in keys:
+            key_count += 1
             block = self._policy.get(key)
             assert block is not None, f"Block {key!r} not found in cache"
             assert block.is_ready, f"Block {key!r} is not ready for reading"
             block.ref_cnt += 1
             blocks.append(block)
-        return self._get_load_store_spec(keys, blocks)
+        spec = self._get_load_store_spec(keys, blocks)
+        if profiler._active:
+            profiler.add_event(
+                "cpu_offload_manager.prepare_load",
+                "kv_offload",
+                start_ns,
+                time.perf_counter_ns() - start_ns,
+                args={"num_keys": key_count},
+            )
+        return spec
 
     def touch(self, keys: Iterable[OffloadKey]) -> None:
         self._policy.touch(keys)
@@ -115,17 +141,33 @@ class CPUOffloadingManager(OffloadingManager):
             block.ref_cnt -= 1
 
     def prepare_store(self, keys: Iterable[OffloadKey]) -> PrepareStoreOutput | None:
+        start_ns = time.perf_counter_ns()
         keys_list = list(keys)
 
         # filter out blocks that are already stored
         keys_to_store = [k for k in keys_list if self._policy.get(k) is None]
 
         if not keys_to_store:
-            return PrepareStoreOutput(
+            output = PrepareStoreOutput(
                 keys_to_store=[],
                 store_spec=self._get_load_store_spec([], []),
                 evicted_keys=[],
             )
+            if profiler._active:
+                profiler.add_event(
+                    "cpu_offload_manager.prepare_store",
+                    "kv_offload",
+                    start_ns,
+                    time.perf_counter_ns() - start_ns,
+                    args={
+                        "num_keys": len(keys_list),
+                        "keys_to_store": 0,
+                        "evicted_keys": 0,
+                        "free_blocks": self._get_num_free_blocks(),
+                        "result": "already_stored",
+                    },
+                )
+            return output
 
         num_blocks_to_evict = len(keys_to_store) - self._get_num_free_blocks()
 
@@ -136,6 +178,20 @@ class CPUOffloadingManager(OffloadingManager):
             protected = set(keys_list)
             evicted = self._policy.evict(num_blocks_to_evict, protected)
             if evicted is None:
+                if profiler._active:
+                    profiler.add_event(
+                        "cpu_offload_manager.prepare_store",
+                        "kv_offload",
+                        start_ns,
+                        time.perf_counter_ns() - start_ns,
+                        args={
+                            "num_keys": len(keys_list),
+                            "keys_to_store": len(keys_to_store),
+                            "evicted_keys": 0,
+                            "free_blocks": self._get_num_free_blocks(),
+                            "result": "eviction_blocked",
+                        },
+                    )
                 return None
             for key, block in evicted:
                 self._free_block(block)
@@ -162,11 +218,26 @@ class CPUOffloadingManager(OffloadingManager):
         # build store specs for allocated blocks
         store_spec = self._get_load_store_spec(keys_to_store, blocks)
 
-        return PrepareStoreOutput(
+        output = PrepareStoreOutput(
             keys_to_store=keys_to_store,
             store_spec=store_spec,
             evicted_keys=to_evict,
         )
+        if profiler._active:
+            profiler.add_event(
+                "cpu_offload_manager.prepare_store",
+                "kv_offload",
+                start_ns,
+                time.perf_counter_ns() - start_ns,
+                args={
+                    "num_keys": len(keys_list),
+                    "keys_to_store": len(keys_to_store),
+                    "evicted_keys": len(to_evict),
+                    "free_blocks": self._get_num_free_blocks(),
+                    "result": "prepared",
+                },
+            )
+        return output
 
     def complete_store(self, keys: Iterable[OffloadKey], success: bool = True) -> None:
         stored_keys: list[OffloadKey] = []

@@ -173,6 +173,7 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         profile_tid: str = "kv_transfer",
         req_id: str = "",
     ) -> bool:
+        submit_start_ns = time.perf_counter_ns()
         src_spec, dst_spec = transfer_spec
         assert isinstance(src_spec, BlockIDsLoadStoreSpec)
         assert isinstance(dst_spec, BlockIDsLoadStoreSpec)
@@ -190,13 +191,24 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
 
         src_block_ids = np.empty(dst_sub_block_count, dtype=np.int64)
         dst_block_ids = np.empty(dst_sub_block_count, dtype=np.int64)
-        expand_block_ids(
-            src_blocks,
-            self.src_block_size_factor,
-            src_block_ids,
-            skip_count=src_sub_blocks_to_skip,
-        )
-        expand_block_ids(dst_blocks, self.dst_block_size_factor, dst_block_ids)
+        with profile_scope(
+            f"cpu_gpu_transfer.expand_block_ids(job={job_id})",
+            "kv_offload",
+            args={
+                "req_id": req_id,
+                "direction": "gpu_to_cpu" if self.gpu_to_cpu else "cpu_to_gpu",
+                "src_blocks": int(src_blocks.size),
+                "dst_blocks": int(dst_blocks.size),
+                "dst_sub_blocks": int(dst_sub_block_count),
+            },
+        ):
+            expand_block_ids(
+                src_blocks,
+                self.src_block_size_factor,
+                src_block_ids,
+                skip_count=src_sub_blocks_to_skip,
+            )
+            expand_block_ids(dst_blocks, self.dst_block_size_factor, dst_block_ids)
 
         # Build flat pointer arrays for all tensors × all block pairs.
         num_pairs = dst_sub_block_count
@@ -207,44 +219,78 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
         all_dst = np.empty(total, dtype=np.int64)
         all_sizes = np.empty(total, dtype=np.int64)
 
-        for t_idx, bsz in enumerate(self._block_size_in_bytes_arr):
-            start = t_idx * num_pairs
-            end = start + num_pairs
-            all_src[start:end] = self._src_base_ptrs[t_idx] + src_block_ids * bsz
-            all_dst[start:end] = self._dst_base_ptrs[t_idx] + dst_block_ids * bsz
-            all_sizes[start:end] = bsz
+        with profile_scope(
+            f"cpu_gpu_transfer.build_pointer_arrays(job={job_id})",
+            "kv_offload",
+            args={
+                "req_id": req_id,
+                "num_pairs": int(num_pairs),
+                "num_tensors": int(num_tensors),
+                "copy_entries": int(total),
+            },
+        ):
+            for t_idx, bsz in enumerate(self._block_size_in_bytes_arr):
+                start = t_idx * num_pairs
+                end = start + num_pairs
+                all_src[start:end] = self._src_base_ptrs[t_idx] + src_block_ids * bsz
+                all_dst[start:end] = self._dst_base_ptrs[t_idx] + dst_block_ids * bsz
+                all_sizes[start:end] = bsz
 
-        batch_src = torch.from_numpy(all_src)
-        batch_dst = torch.from_numpy(all_dst)
-        batch_sizes = torch.from_numpy(all_sizes)
+        with profile_scope(
+            f"cpu_gpu_transfer.wrap_pointer_tensors(job={job_id})",
+            "kv_offload",
+            args={"req_id": req_id, "copy_entries": int(total)},
+        ):
+            batch_src = torch.from_numpy(all_src)
+            batch_dst = torch.from_numpy(all_dst)
+            batch_sizes = torch.from_numpy(all_sizes)
 
-        stream = self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
-        start_event = (
-            self._event_pool.pop()
-            if self._event_pool
-            else torch.Event(enable_timing=True)
-        )
-        end_event = (
-            self._event_pool.pop()
-            if self._event_pool
-            else torch.Event(enable_timing=True)
-        )
+        with profile_scope(
+            f"cpu_gpu_transfer.alloc_stream_events(job={job_id})",
+            "kv_offload",
+            args={
+                "req_id": req_id,
+                "reused_stream": bool(self._stream_pool),
+                "reused_events": len(self._event_pool),
+            },
+        ):
+            stream = self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
+            start_event = (
+                self._event_pool.pop()
+                if self._event_pool
+                else torch.Event(enable_timing=True)
+            )
+            end_event = (
+                self._event_pool.pop()
+                if self._event_pool
+                else torch.Event(enable_timing=True)
+            )
 
         wall_start_ns = time.perf_counter_ns()
 
-        if self.gpu_to_cpu:
-            # wait for model computation to finish before offloading
-            stream.wait_stream(torch.cuda.current_stream())
-        if self._transfers:
-            last_transfer: Transfer = self._transfers[-1]
-            last_event = last_transfer.end_event
-            # assure job will start only after the previous one completes
-            stream.wait_event(last_event)
-        with torch.cuda.stream(stream):
-            start_event.record(stream)
-            if total > 0:
-                ops.swap_blocks_batch(batch_src, batch_dst, batch_sizes)
-            end_event.record(stream)
+        with profile_scope(
+            f"cpu_gpu_transfer.submit_cuda(job={job_id})",
+            "kv_offload",
+            args={
+                "req_id": req_id,
+                "direction": "gpu_to_cpu" if self.gpu_to_cpu else "cpu_to_gpu",
+                "copy_entries": int(total),
+                "queued_behind_transfer": bool(self._transfers),
+            },
+        ):
+            if self.gpu_to_cpu:
+                # wait for model computation to finish before offloading
+                stream.wait_stream(torch.cuda.current_stream())
+            if self._transfers:
+                last_transfer: Transfer = self._transfers[-1]
+                last_event = last_transfer.end_event
+                # assure job will start only after the previous one completes
+                stream.wait_event(last_event)
+            with torch.cuda.stream(stream):
+                start_event.record(stream)
+                if total > 0:
+                    ops.swap_blocks_batch(batch_src, batch_dst, batch_sizes)
+                end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
         self._transfers.append(
@@ -259,6 +305,21 @@ class SingleDirectionOffloadingHandler(OffloadingHandler):
                 req_id=req_id,
             )
         )
+
+        if profiler._active:
+            profiler.add_event(
+                f"cpu_gpu_transfer.submit_e2e(job={job_id})",
+                "kv_offload",
+                submit_start_ns,
+                time.perf_counter_ns() - submit_start_ns,
+                tid=profile_tid,
+                args={
+                    "req_id": req_id,
+                    "direction": "gpu_to_cpu" if self.gpu_to_cpu else "cpu_to_gpu",
+                    "copy_entries": int(total),
+                    "num_bytes": dst_sub_block_count * self.group_block_size_in_bytes[0],
+                },
+            )
 
         # success
         return True

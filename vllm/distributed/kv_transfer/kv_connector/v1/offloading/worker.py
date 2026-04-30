@@ -351,40 +351,55 @@ class OffloadingConnectorWorker:
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
         self._profile_step += 1
-        for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            req_id, _ = self._jobs[job_id]
-            tid = self._req_profile_tid.get(req_id, "kv_store")
-            success = self.worker.transfer_async(
-                job_id, transfer_spec, profile_tid=tid, req_id=req_id
-            )
-            assert success
+        with profile_scope(
+            f"start_kv_transfers.submit_pending_stores(step={self._profile_step})",
+            "kv_offload",
+            args={"num_jobs": len(self._unsubmitted_store_jobs)},
+        ):
+            for job_id, transfer_spec in self._unsubmitted_store_jobs:
+                req_id, _ = self._jobs[job_id]
+                tid = self._req_profile_tid.get(req_id, "kv_store")
+                success = self.worker.transfer_async(
+                    job_id, transfer_spec, profile_tid=tid, req_id=req_id
+                )
+                assert success
         self._unsubmitted_store_jobs.clear()
 
-        for req_id, transfer_spec in metadata.reqs_to_load.items():
-            job_id = self._generate_job_id()
-            self._jobs[job_id] = (req_id, False)
-            assert req_id not in self._load_job
-            self._load_job[req_id] = job_id
-            load_start_ns = time.perf_counter_ns()
-            self._load_submit_time_ns[job_id] = load_start_ns
-            tid = self._get_or_alloc_req_tid(req_id, load_start_ns)
-            success = self.worker.transfer_async(
-                job_id, transfer_spec, profile_tid=tid, req_id=req_id
-            )
-            assert success
+        with profile_scope(
+            f"start_kv_transfers.submit_loads(step={self._profile_step})",
+            "kv_offload",
+            args={"num_jobs": len(metadata.reqs_to_load)},
+        ):
+            for req_id, transfer_spec in metadata.reqs_to_load.items():
+                job_id = self._generate_job_id()
+                self._jobs[job_id] = (req_id, False)
+                assert req_id not in self._load_job
+                self._load_job[req_id] = job_id
+                load_start_ns = time.perf_counter_ns()
+                self._load_submit_time_ns[job_id] = load_start_ns
+                tid = self._get_or_alloc_req_tid(req_id, load_start_ns)
+                success = self.worker.transfer_async(
+                    job_id, transfer_spec, profile_tid=tid, req_id=req_id
+                )
+                assert success
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
-        for req_id, transfer_spec in metadata.reqs_to_store.items():
-            job_id = self._generate_job_id()
-            self._jobs[job_id] = (req_id, True)
-            self._store_jobs[req_id].add(job_id)
-            # NOTE(orozery): defer the store to the beginning of the next engine step,
-            # so that offloading starts AFTER transfers related to token sampling,
-            # thereby avoiding delays to token generation due to offloading.
-            start_ns = time.perf_counter_ns()
-            self._store_queue_time_ns[job_id] = start_ns
-            self._get_or_alloc_req_tid(req_id, start_ns)
-            self._unsubmitted_store_jobs.append((job_id, transfer_spec))
+        with profile_scope(
+            "prepare_store_kv.queue_stores",
+            "kv_offload",
+            args={"num_jobs": len(metadata.reqs_to_store)},
+        ):
+            for req_id, transfer_spec in metadata.reqs_to_store.items():
+                job_id = self._generate_job_id()
+                self._jobs[job_id] = (req_id, True)
+                self._store_jobs[req_id].add(job_id)
+                # NOTE(orozery): defer the store to the beginning of the next engine step,
+                # so that offloading starts AFTER transfers related to token sampling,
+                # thereby avoiding delays to token generation due to offloading.
+                start_ns = time.perf_counter_ns()
+                self._store_queue_time_ns[job_id] = start_ns
+                self._get_or_alloc_req_tid(req_id, start_ns)
+                self._unsubmitted_store_jobs.append((job_id, transfer_spec))
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """

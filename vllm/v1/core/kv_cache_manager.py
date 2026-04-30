@@ -2,9 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal, overload
+
+from simple_profiler import profiler
 
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.logger import init_logger
@@ -192,6 +195,7 @@ class KVCacheManager:
         if not self.enable_caching or request.skip_reading_prefix_cache:
             return self.empty_kv_cache_blocks, 0
 
+        start_ns = time.perf_counter_ns()
         # NOTE: When all tokens hit the cache, we must recompute the last token
         # to obtain logits. Thus, set max_cache_hit_length to prompt_length - 1.
         # This can trigger recomputation of an entire block, rather than just
@@ -204,6 +208,20 @@ class KVCacheManager:
                 request.block_hashes, max_cache_hit_length
             )
         )
+        if profiler._active:
+            profiler.add_event(
+                "gpu_prefix_cache.find_longest_hit",
+                "prefix_cache",
+                start_ns,
+                time.perf_counter_ns() - start_ns,
+                args={
+                    "req_id": request.request_id,
+                    "num_tokens": request.num_tokens,
+                    "num_block_hashes": len(request.block_hashes),
+                    "max_cache_hit_length": max_cache_hit_length,
+                    "num_hit_tokens": num_new_computed_tokens,
+                },
+            )
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
