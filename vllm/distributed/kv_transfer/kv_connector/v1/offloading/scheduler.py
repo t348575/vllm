@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from itertools import islice
 from typing import Any, NamedTuple
 
-from simple_profiler import profile_scope, profiler
+from simple_profiler import profile_category, profile_scope, profiler
 
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
@@ -86,30 +86,49 @@ class RequestOffloadState:
         )
 
     def update_offload_keys(self) -> None:
-        for group_config, group_state in zip(
-            self.config.kv_group_configs, self.group_states
+        with profile_scope(
+            "request_offload_state.update_offload_keys",
+            "kv_offload",
+            args={"req_id": self.req.request_id},
         ):
-            for req_block_hash in islice(
-                self.req.block_hashes,
-                group_config.hash_block_size_factor * len(group_state.offload_keys)
-                + group_config.hash_block_size_factor
-                - 1,
-                None,
-                group_config.hash_block_size_factor,
+            for group_config, group_state in zip(
+                self.config.kv_group_configs, self.group_states
             ):
-                group_state.offload_keys.append(
-                    make_offload_key(req_block_hash, group_config.group_idx)
-                )
+                for req_block_hash in islice(
+                    self.req.block_hashes,
+                    group_config.hash_block_size_factor * len(group_state.offload_keys)
+                    + group_config.hash_block_size_factor
+                    - 1,
+                    None,
+                    group_config.hash_block_size_factor,
+                ):
+                    group_state.offload_keys.append(
+                        make_offload_key(req_block_hash, group_config.group_idx)
+                    )
 
     def update_block_id_groups(
         self, new_block_id_groups: tuple[list[int], ...] | None
     ) -> None:
-        if new_block_id_groups is None:
-            return
+        with profile_scope(
+            "request_offload_state.update_block_id_groups",
+            "kv_offload",
+            args={"req_id": self.req.request_id},
+        ):
+            if new_block_id_groups is None:
+                return
 
-        assert len(new_block_id_groups) == len(self.group_states)
-        for group_state, new_blocks in zip(self.group_states, new_block_id_groups):
-            group_state.block_ids.extend(new_blocks)
+            assert len(new_block_id_groups) == len(self.group_states)
+            for group_state, new_blocks in zip(self.group_states, new_block_id_groups):
+                group_state.block_ids.extend(new_blocks)
+
+    def clear_block_id_groups(self) -> None:
+        with profile_scope(
+            "request_offload_state.clear_block_id_groups",
+            "kv_offload",
+            args={"req_id": self.req.request_id},
+        ):
+            for group_state in self.group_states:
+                group_state.block_ids.clear()
 
 
 class OffloadingConnectorScheduler:
@@ -133,6 +152,20 @@ class OffloadingConnectorScheduler:
         self._reqs_being_loaded = defaultdict[ReqId, set[OffloadKey]](set)
 
     def get_num_new_matched_tokens(
+        self, request: Request, num_computed_tokens: int
+    ) -> tuple[int | None, bool]:
+        with profile_scope(
+            "offload_scheduler.get_num_new_matched_tokens",
+            "kv_offload",
+            args={
+                "req_id": request.request_id,
+                "num_tokens": request.num_tokens,
+                "num_computed_tokens": num_computed_tokens,
+            },
+        ):
+            return self._get_num_new_matched_tokens(request, num_computed_tokens)
+
+    def _get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         """
@@ -184,8 +217,7 @@ class OffloadingConnectorScheduler:
 
         if req_status := self._req_status.get(request.request_id):
             # make sure block IDs are cleared
-            for group_state in req_status.group_states:
-                group_state.block_ids.clear()
+            req_status.clear_block_id_groups()
         else:
             with profile_scope(
                 "offload_scheduler.init_req_state",
@@ -273,6 +305,21 @@ class OffloadingConnectorScheduler:
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
     ):
+        with profile_scope(
+            "offload_scheduler.update_state_after_alloc",
+            "kv_offload",
+            args={
+                "req_id": request.request_id,
+                "num_external_tokens": num_external_tokens,
+            },
+        ):
+            return self._update_state_after_alloc(
+                request, blocks, num_external_tokens
+            )
+
+    def _update_state_after_alloc(
+        self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
+    ):
         if num_external_tokens == 0:
             return
 
@@ -330,6 +377,7 @@ class OffloadingConnectorScheduler:
         if self._blocks_being_loaded is not None:
             self._blocks_being_loaded.update(req_blocks_being_loaded)
 
+    @profile_category("kv_offload")
     def _get_reqs_to_store(self, scheduler_output: SchedulerOutput):
         # Below assertion will be removed once this function supports HMA
         assert len(self.config.kv_group_configs) == 1
@@ -442,22 +490,35 @@ class OffloadingConnectorScheduler:
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
-        meta = OffloadingConnectorMetadata(
-            reqs_to_load=self._reqs_to_load,
-            reqs_to_store=self._get_reqs_to_store(scheduler_output),
-            reqs_to_flush=scheduler_output.preempted_req_ids,
-        )
-        self._reqs_to_load = {}
+        with profile_scope(
+            "offload_scheduler.build_connector_meta",
+            "kv_offload",
+            args={
+                "num_reqs_to_load": len(self._reqs_to_load),
+                "num_preempted": len(scheduler_output.preempted_req_ids or ()),
+            },
+        ):
+            meta = OffloadingConnectorMetadata(
+                reqs_to_load=self._reqs_to_load,
+                reqs_to_store=self._get_reqs_to_store(scheduler_output),
+                reqs_to_flush=scheduler_output.preempted_req_ids,
+            )
+            self._reqs_to_load = {}
 
-        # NOTE (orozery): we should move this logic to update_connector_output
-        # once KVConnectorOutput allows us to report completed transfers
-        for req_id in scheduler_output.preempted_req_ids or ():
-            keys = self._reqs_being_stored.get(req_id)
-            if keys:
-                self.manager.complete_store(keys)
-                keys.clear()
+            # NOTE (orozery): we should move this logic to update_connector_output
+            # once KVConnectorOutput allows us to report completed transfers
+            for req_id in scheduler_output.preempted_req_ids or ():
+                keys = self._reqs_being_stored.get(req_id)
+                if keys:
+                    with profile_scope(
+                        "offload_scheduler.complete_preempted_store",
+                        "kv_offload",
+                        args={"req_id": req_id, "num_keys": len(keys)},
+                    ):
+                        self.manager.complete_store(keys)
+                    keys.clear()
 
-        return meta
+            return meta
 
     def update_connector_output(self, connector_output: KVConnectorOutput):
         """
@@ -467,17 +528,35 @@ class OffloadingConnectorScheduler:
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
-        for req_id in connector_output.finished_sending or []:
-            keys = self._reqs_being_stored.pop(req_id, None)
-            if keys:
-                self.manager.complete_store(keys)
+        with profile_scope(
+            "offload_scheduler.update_connector_output",
+            "kv_offload",
+            args={
+                "finished_sending": len(connector_output.finished_sending or ()),
+                "finished_recving": len(connector_output.finished_recving or ()),
+            },
+        ):
+            for req_id in connector_output.finished_sending or []:
+                keys = self._reqs_being_stored.pop(req_id, None)
+                if keys:
+                    with profile_scope(
+                        "offload_scheduler.complete_store",
+                        "kv_offload",
+                        args={"req_id": req_id, "num_keys": len(keys)},
+                    ):
+                        self.manager.complete_store(keys)
 
-        for req_id in connector_output.finished_recving or []:
-            keys = self._reqs_being_loaded.pop(req_id, None)
-            if keys:
-                if self._blocks_being_loaded:
-                    self._blocks_being_loaded.difference_update(keys)
-                self.manager.complete_load(keys)
+            for req_id in connector_output.finished_recving or []:
+                keys = self._reqs_being_loaded.pop(req_id, None)
+                if keys:
+                    if self._blocks_being_loaded:
+                        self._blocks_being_loaded.difference_update(keys)
+                    with profile_scope(
+                        "offload_scheduler.complete_load",
+                        "kv_offload",
+                        args={"req_id": req_id, "num_keys": len(keys)},
+                    ):
+                        self.manager.complete_load(keys)
 
     def request_finished(
         self,
@@ -494,14 +573,19 @@ class OffloadingConnectorScheduler:
             Optional KVTransferParams to be included in the request outputs
             returned by the engine.
         """
-        req_id = request.request_id
+        with profile_scope(
+            "offload_scheduler.request_finished",
+            "kv_offload",
+            args={"req_id": request.request_id, "num_block_ids": len(block_ids)},
+        ):
+            req_id = request.request_id
 
-        # TODO(orozery): possibly kickoff offload for last block
-        # which may have been deferred due to async scheduling
-        self._req_status.pop(req_id, None)
+            # TODO(orozery): possibly kickoff offload for last block
+            # which may have been deferred due to async scheduling
+            self._req_status.pop(req_id, None)
 
-        request_being_stored = req_id in self._reqs_being_stored
-        return request_being_stored, None
+            request_being_stored = req_id in self._reqs_being_stored
+            return request_being_stored, None
 
     def take_events(self) -> Iterable[KVCacheEvent]:
         """Take the KV cache events from the connector.
@@ -509,20 +593,28 @@ class OffloadingConnectorScheduler:
         Returns:
             A list of KV cache events.
         """
-        for event in self.manager.take_events():
-            block_hashes = [get_offload_block_hash(key) for key in event.keys]
-            if event.removed:
-                yield BlockRemoved(block_hashes=block_hashes, medium=event.medium)
-            else:
-                yield BlockStored(
-                    block_hashes=block_hashes,
-                    parent_block_hash=None,
-                    token_ids=[],
-                    lora_id=None,
-                    block_size=event.block_size,
-                    medium=event.medium,
-                    lora_name=None,
-                )
+        with profile_scope("offload_scheduler.take_events", "kv_offload"):
+            events = list(self.manager.take_events())
+        for event in events:
+            with profile_scope(
+                "offload_scheduler.convert_event",
+                "kv_offload",
+                args={"num_keys": len(event.keys), "removed": event.removed},
+            ):
+                block_hashes = [get_offload_block_hash(key) for key in event.keys]
+                if event.removed:
+                    yield BlockRemoved(block_hashes=block_hashes, medium=event.medium)
+                else:
+                    yield BlockStored(
+                        block_hashes=block_hashes,
+                        parent_block_hash=None,
+                        token_ids=[],
+                        lora_id=None,
+                        block_size=event.block_size,
+                        medium=event.medium,
+                        lora_name=None,
+                    )
 
     def shutdown(self) -> None:
-        self.manager.shutdown()
+        with profile_scope("offload_scheduler.shutdown", "kv_offload"):
+            self.manager.shutdown()

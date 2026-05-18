@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 import torch.nn as nn
+from simple_profiler import profile_scope
 
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode, VllmConfig, set_current_vllm_config
@@ -742,17 +743,33 @@ class Worker(WorkerBase):
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
-        return self.model_runner.sample_tokens(grammar_output)
+        with profile_scope("gpu_worker.sample_tokens", "gpu_runner"):
+            return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        with profile_scope(
+            "gpu_worker.execute_model",
+            "gpu_runner",
+            args={
+                "num_scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
+                "num_scheduled_reqs": len(scheduler_output.num_scheduled_tokens),
+                "has_kv_connector": has_kv_transfer_group(),
+            },
+        ):
+            return self._execute_model_profiled(scheduler_output)
+
+    def _execute_model_profiled(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
         # ensure any previous non-blocking PP sends are complete
         if self._pp_send_work:
-            for handle in self._pp_send_work:
-                handle.wait()
-            self._pp_send_work = []
+            with profile_scope("gpu_worker.wait_previous_pp_send", "gpu_runner"):
+                for handle in self._pp_send_work:
+                    handle.wait()
+                self._pp_send_work = []
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
@@ -775,15 +792,16 @@ class Worker(WorkerBase):
             # TODO(lucas): This is pretty gross; ideally we should only ever call
             # `_determine_batch_execution_and_padding` once (will get called again
             # in `execute_model`) but this requires a larger refactor of PP.
-            _, batch_desc, _, _, _ = (
-                self.model_runner._determine_batch_execution_and_padding(
-                    num_tokens=num_scheduled_tokens,
-                    num_reqs=len(num_scheduled_tokens_np),
-                    num_scheduled_tokens_np=num_scheduled_tokens_np,
-                    max_num_scheduled_tokens=num_scheduled_tokens_np.max(),
-                    use_cascade_attn=False,  # TODO(lucas): Handle cascade attention
+            with profile_scope("gpu_worker.pp_determine_batch_padding", "gpu_runner"):
+                _, batch_desc, _, _, _ = (
+                    self.model_runner._determine_batch_execution_and_padding(
+                        num_tokens=num_scheduled_tokens,
+                        num_reqs=len(num_scheduled_tokens_np),
+                        num_scheduled_tokens_np=num_scheduled_tokens_np,
+                        max_num_scheduled_tokens=num_scheduled_tokens_np.max(),
+                        use_cascade_attn=False,  # TODO(lucas): Handle cascade attention
+                    )
                 )
-            )
             all_gather_tensors = {
                 "residual": not is_residual_scattered_for_sp(
                     self.vllm_config, batch_desc.num_tokens
@@ -791,12 +809,13 @@ class Worker(WorkerBase):
             }
 
         if forward_pass and not get_pp_group().is_first_rank:
-            tensor_dict, comm_handles, comm_postprocess = (
-                get_pp_group().irecv_tensor_dict(
-                    all_gather_group=get_tp_group(),
-                    all_gather_tensors=all_gather_tensors,
+            with profile_scope("gpu_worker.pp_irecv_tensor_dict", "gpu_runner"):
+                tensor_dict, comm_handles, comm_postprocess = (
+                    get_pp_group().irecv_tensor_dict(
+                        all_gather_group=get_tp_group(),
+                        all_gather_tensors=all_gather_tensors,
+                    )
                 )
-            )
             assert tensor_dict is not None
             intermediate_tensors = AsyncIntermediateTensors(
                 tensor_dict,
@@ -805,9 +824,10 @@ class Worker(WorkerBase):
             )
 
         with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
+            with profile_scope("gpu_worker.model_runner_execute_model", "gpu_runner"):
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model
@@ -827,11 +847,12 @@ class Worker(WorkerBase):
         )
 
         # launch non-blocking send of intermediate tensors
-        self._pp_send_work = get_pp_group().isend_tensor_dict(
-            output.tensors,
-            all_gather_group=get_tp_group(),
-            all_gather_tensors=all_gather_tensors,
-        )
+        with profile_scope("gpu_worker.pp_isend_tensor_dict", "gpu_runner"):
+            self._pp_send_work = get_pp_group().isend_tensor_dict(
+                output.tensors,
+                all_gather_group=get_tp_group(),
+                all_gather_tensors=all_gather_tensors,
+            )
 
         return None
 

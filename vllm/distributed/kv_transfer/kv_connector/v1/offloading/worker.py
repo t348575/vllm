@@ -5,7 +5,7 @@ from collections import defaultdict
 from dataclasses import replace
 
 import torch
-from simple_profiler import profile_scope, profiler
+from simple_profiler import profile_category, profile_scope, profiler
 
 from vllm.config import get_layers_from_vllm_config
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -70,29 +70,38 @@ class OffloadingConnectorWorker:
         self._finished_reqs_waiting_for_store: set[ReqId] = set()
 
     def _generate_job_id(self) -> int:
-        job_id = self._job_counter
-        self._job_counter = job_id + 1
-        return job_id
+        with profile_scope("offload_worker.generate_job_id", "kv_offload"):
+            job_id = self._job_counter
+            self._job_counter = job_id + 1
+            return job_id
 
     def _get_or_alloc_req_tid(self, req_id: ReqId, start_ns: int) -> str:
-        if req_id not in self._req_profile_tid:
-            chosen = None
-            for slot, end_ns in self._req_profile_slot_end_ns.items():
-                if end_ns <= start_ns:
-                    chosen = slot
-                    break
-            if chosen is None:
-                chosen = len(self._req_profile_slot_end_ns)
-                self._req_profile_slot_end_ns[chosen] = 0
-            self._req_profile_tid[req_id] = f"req_{chosen}"
-        return self._req_profile_tid[req_id]
+        with profile_scope(
+            "offload_worker.get_or_alloc_req_tid",
+            "kv_offload",
+            args={"req_id": req_id},
+        ):
+            if req_id not in self._req_profile_tid:
+                chosen = None
+                for slot, end_ns in self._req_profile_slot_end_ns.items():
+                    if end_ns <= start_ns:
+                        chosen = slot
+                        break
+                if chosen is None:
+                    chosen = len(self._req_profile_slot_end_ns)
+                    self._req_profile_slot_end_ns[chosen] = 0
+                self._req_profile_tid[req_id] = f"req_{chosen}"
+            return self._req_profile_tid[req_id]
 
     def _release_req_tid(self, req_id: ReqId, end_ns: int) -> None:
-        tid = self._req_profile_tid.pop(req_id, None)
-        if tid is None:
-            return
-        slot = int(tid.split("_")[1])
-        self._req_profile_slot_end_ns[slot] = end_ns
+        with profile_scope(
+            "offload_worker.release_req_tid", "kv_offload", args={"req_id": req_id}
+        ):
+            tid = self._req_profile_tid.pop(req_id, None)
+            if tid is None:
+                return
+            slot = int(tid.split("_")[1])
+            self._req_profile_slot_end_ns[slot] = end_ns
 
     def get_req_profile_tid(self, req_id: ReqId) -> str | None:
         return self._req_profile_tid.get(req_id)
@@ -105,6 +114,16 @@ class OffloadingConnectorWorker:
             self.worker.register_handler(src_cls, dst_cls, handler)
 
     def register_kv_caches(
+        self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
+    ):
+        with profile_scope(
+            "offload_worker.register_kv_caches",
+            "kv_offload",
+            args={"num_layers": len(kv_caches)},
+        ):
+            self._register_kv_caches(kv_caches)
+
+    def _register_kv_caches(
         self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
     ):
         layer_names = list(kv_caches.keys())
@@ -331,6 +350,7 @@ class OffloadingConnectorWorker:
 
         self._register_handlers(canonical_kv_caches)
 
+    @profile_category("kv_offload")
     def handle_preemptions(self, kv_connector_metadata: OffloadingConnectorMetadata):
         step = self._profile_step
         self._profile_step += 1
@@ -350,38 +370,56 @@ class OffloadingConnectorWorker:
                     self.worker.wait(job_ids)
 
     def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
-        self._profile_step += 1
         with profile_scope(
-            f"start_kv_transfers.submit_pending_stores(step={self._profile_step})",
+            "offload_worker.start_kv_transfers",
             "kv_offload",
-            args={"num_jobs": len(self._unsubmitted_store_jobs)},
+            args={
+                "num_pending_stores": len(self._unsubmitted_store_jobs),
+                "num_loads": len(metadata.reqs_to_load),
+            },
         ):
-            for job_id, transfer_spec in self._unsubmitted_store_jobs:
-                req_id, _ = self._jobs[job_id]
-                tid = self._req_profile_tid.get(req_id, "kv_store")
-                success = self.worker.transfer_async(
-                    job_id, transfer_spec, profile_tid=tid, req_id=req_id
-                )
-                assert success
-        self._unsubmitted_store_jobs.clear()
+            self._profile_step += 1
+            with profile_scope(
+                f"start_kv_transfers.submit_pending_stores(step={self._profile_step})",
+                "kv_offload",
+                args={"num_jobs": len(self._unsubmitted_store_jobs)},
+            ):
+                for job_id, transfer_spec in self._unsubmitted_store_jobs:
+                    req_id, _ = self._jobs[job_id]
+                    tid = self._req_profile_tid.get(req_id, "kv_store")
+                    with profile_scope(
+                        "offload_worker.submit_store_transfer",
+                        "kv_offload",
+                        args={"job_id": job_id, "req_id": req_id},
+                    ):
+                        success = self.worker.transfer_async(
+                            job_id, transfer_spec, profile_tid=tid, req_id=req_id
+                        )
+                    assert success
+            self._unsubmitted_store_jobs.clear()
 
-        with profile_scope(
-            f"start_kv_transfers.submit_loads(step={self._profile_step})",
-            "kv_offload",
-            args={"num_jobs": len(metadata.reqs_to_load)},
-        ):
-            for req_id, transfer_spec in metadata.reqs_to_load.items():
-                job_id = self._generate_job_id()
-                self._jobs[job_id] = (req_id, False)
-                assert req_id not in self._load_job
-                self._load_job[req_id] = job_id
-                load_start_ns = time.perf_counter_ns()
-                self._load_submit_time_ns[job_id] = load_start_ns
-                tid = self._get_or_alloc_req_tid(req_id, load_start_ns)
-                success = self.worker.transfer_async(
-                    job_id, transfer_spec, profile_tid=tid, req_id=req_id
-                )
-                assert success
+            with profile_scope(
+                f"start_kv_transfers.submit_loads(step={self._profile_step})",
+                "kv_offload",
+                args={"num_jobs": len(metadata.reqs_to_load)},
+            ):
+                for req_id, transfer_spec in metadata.reqs_to_load.items():
+                    job_id = self._generate_job_id()
+                    self._jobs[job_id] = (req_id, False)
+                    assert req_id not in self._load_job
+                    self._load_job[req_id] = job_id
+                    load_start_ns = time.perf_counter_ns()
+                    self._load_submit_time_ns[job_id] = load_start_ns
+                    tid = self._get_or_alloc_req_tid(req_id, load_start_ns)
+                    with profile_scope(
+                        "offload_worker.submit_load_transfer",
+                        "kv_offload",
+                        args={"job_id": job_id, "req_id": req_id},
+                    ):
+                        success = self.worker.transfer_async(
+                            job_id, transfer_spec, profile_tid=tid, req_id=req_id
+                        )
+                    assert success
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         with profile_scope(
@@ -390,17 +428,23 @@ class OffloadingConnectorWorker:
             args={"num_jobs": len(metadata.reqs_to_store)},
         ):
             for req_id, transfer_spec in metadata.reqs_to_store.items():
-                job_id = self._generate_job_id()
-                self._jobs[job_id] = (req_id, True)
-                self._store_jobs[req_id].add(job_id)
-                # NOTE(orozery): defer the store to the beginning of the next engine step,
-                # so that offloading starts AFTER transfers related to token sampling,
-                # thereby avoiding delays to token generation due to offloading.
-                start_ns = time.perf_counter_ns()
-                self._store_queue_time_ns[job_id] = start_ns
-                self._get_or_alloc_req_tid(req_id, start_ns)
-                self._unsubmitted_store_jobs.append((job_id, transfer_spec))
+                with profile_scope(
+                    "prepare_store_kv.queue_store",
+                    "kv_offload",
+                    args={"req_id": req_id},
+                ):
+                    job_id = self._generate_job_id()
+                    self._jobs[job_id] = (req_id, True)
+                    self._store_jobs[req_id].add(job_id)
+                    # NOTE(orozery): defer the store to the beginning of the next engine step,
+                    # so that offloading starts AFTER transfers related to token sampling,
+                    # thereby avoiding delays to token generation due to offloading.
+                    start_ns = time.perf_counter_ns()
+                    self._store_queue_time_ns[job_id] = start_ns
+                    self._get_or_alloc_req_tid(req_id, start_ns)
+                    self._unsubmitted_store_jobs.append((job_id, transfer_spec))
 
+    @profile_category("kv_offload")
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """
         Notifies worker-side connector ids of requests that have
@@ -413,7 +457,9 @@ class OffloadingConnectorWorker:
         """
         finished_sending = set()
         finished_recving = set()
-        for transfer_result in self.worker.get_finished():
+        with profile_scope("offload_worker.poll_finished_transfers", "kv_offload"):
+            transfer_results = self.worker.get_finished()
+        for transfer_result in transfer_results:
             # we currently do not support job failures
             job_id = transfer_result.job_id
             assert transfer_result.success
@@ -447,11 +493,16 @@ class OffloadingConnectorWorker:
                 and transfer_result.transfer_size is not None
                 and transfer_result.transfer_type is not None
             ):
-                self.kv_connector_stats.record_transfer(
-                    num_bytes=transfer_result.transfer_size,
-                    time=transfer_result.transfer_time,
-                    transfer_type=transfer_result.transfer_type,
-                )
+                with profile_scope(
+                    "offload_worker.record_transfer_stats",
+                    "kv_offload",
+                    args={"job_id": job_id, "num_bytes": transfer_result.transfer_size},
+                ):
+                    self.kv_connector_stats.record_transfer(
+                        num_bytes=transfer_result.transfer_size,
+                        time=transfer_result.transfer_time,
+                        transfer_type=transfer_result.transfer_type,
+                    )
             if store:
                 req_jobs = self._store_jobs[req_id]
                 req_jobs.remove(job_id)
@@ -470,13 +521,18 @@ class OffloadingConnectorWorker:
                 finished_recving.add(req_id)
                 self._release_req_tid(req_id, now_ns)
 
-        for req_id in finished_req_ids:
-            pending_req_jobs = self._store_jobs.get(req_id)
-            if pending_req_jobs:
-                self._finished_reqs_waiting_for_store.add(req_id)
-            elif pending_req_jobs is not None:
-                finished_sending.add(req_id)
-                del self._store_jobs[req_id]
+        with profile_scope(
+            "offload_worker.process_finished_requests",
+            "kv_offload",
+            args={"num_finished_req_ids": len(finished_req_ids)},
+        ):
+            for req_id in finished_req_ids:
+                pending_req_jobs = self._store_jobs.get(req_id)
+                if pending_req_jobs:
+                    self._finished_reqs_waiting_for_store.add(req_id)
+                elif pending_req_jobs is not None:
+                    finished_sending.add(req_id)
+                    del self._store_jobs[req_id]
 
         return finished_sending, finished_recving
 
@@ -485,22 +541,24 @@ class OffloadingConnectorWorker:
         Get the KV transfer stats for the connector.
         """
 
-        if self.kv_connector_stats.is_empty():
-            return None
-        # Clear stats for next iteration
-        kv_connector_stats = self.kv_connector_stats
-        self.kv_connector_stats = OffloadingConnectorStats()
-        return kv_connector_stats
+        with profile_scope("offload_worker.get_kv_connector_stats", "kv_offload"):
+            if self.kv_connector_stats.is_empty():
+                return None
+            # Clear stats for next iteration
+            kv_connector_stats = self.kv_connector_stats
+            self.kv_connector_stats = OffloadingConnectorStats()
+            return kv_connector_stats
 
     def shutdown(self) -> None:
-        # Drop deferred store jobs: there is no point in submitting
-        # them during shutdown.
-        self._unsubmitted_store_jobs.clear()
-        self._store_queue_time_ns.clear()
-        self._load_submit_time_ns.clear()
-        self._jobs.clear()
-        self._load_job.clear()
-        self._store_jobs.clear()
-        self._finished_reqs_waiting_for_store.clear()
-        self._req_profile_tid.clear()
-        self.worker.shutdown()
+        with profile_scope("offload_worker.shutdown", "kv_offload"):
+            # Drop deferred store jobs: there is no point in submitting
+            # them during shutdown.
+            self._unsubmitted_store_jobs.clear()
+            self._store_queue_time_ns.clear()
+            self._load_submit_time_ns.clear()
+            self._jobs.clear()
+            self._load_job.clear()
+            self._store_jobs.clear()
+            self._finished_reqs_waiting_for_store.clear()
+            self._req_profile_tid.clear()
+            self.worker.shutdown()

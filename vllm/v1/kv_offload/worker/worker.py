@@ -3,6 +3,8 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
+from simple_profiler import profile_scope
+
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.abstract import LoadStoreSpec
 
@@ -131,25 +133,37 @@ class OffloadingWorker:
         """
         src, dst = spec
         transfer_type = (src.medium(), dst.medium())
-        handler = self.transfer_type_to_handler.get(transfer_type)
-        assert handler is not None
-        try:
-            success = handler.transfer_async(job_id, spec, profile_tid=profile_tid, req_id=req_id)
-        except Exception as e:
-            logger.warning(
-                "Exception in %r transfer %d: %r",
-                transfer_type,
-                job_id,
-                e,
-                exc_info=True,
-            )
-            return False
+        with profile_scope(
+            "offloading_worker.transfer_async",
+            "kv_offload",
+            args={
+                "job_id": job_id,
+                "req_id": req_id,
+                "src": transfer_type[0],
+                "dst": transfer_type[1],
+            },
+        ):
+            handler = self.transfer_type_to_handler.get(transfer_type)
+            assert handler is not None
+            try:
+                success = handler.transfer_async(
+                    job_id, spec, profile_tid=profile_tid, req_id=req_id
+                )
+            except Exception as e:
+                logger.warning(
+                    "Exception in %r transfer %d: %r",
+                    transfer_type,
+                    job_id,
+                    e,
+                    exc_info=True,
+                )
+                return False
 
-        if not success:
-            logger.warning("Failed to submit %r transfer %d", transfer_type, job_id)
-        else:
-            logger.debug("Submitted %r transfer %d: %r", transfer_type, job_id, spec)
-        return success
+            if not success:
+                logger.warning("Failed to submit %r transfer %d", transfer_type, job_id)
+            else:
+                logger.debug("Submitted %r transfer %d: %r", transfer_type, job_id, spec)
+            return success
 
     def get_finished(self) -> list[TransferResult]:
         """
@@ -158,10 +172,15 @@ class OffloadingWorker:
         Returns:
             A list of TransferResults
         """
-        finished = []
-        for handler in self.handlers:
-            finished.extend(handler.get_finished())
-        return finished
+        with profile_scope(
+            "offloading_worker.get_finished",
+            "kv_offload",
+            args={"num_handlers": len(self.handlers)},
+        ):
+            finished = []
+            for handler in self.handlers:
+                finished.extend(handler.get_finished())
+            return finished
 
     def wait(self, job_ids: set[int]) -> None:
         """
@@ -170,9 +189,17 @@ class OffloadingWorker:
         Args:
             job_ids: The set of job IDs to wait for.
         """
-        for handler in self.handlers:
-            handler.wait(job_ids)
+        with profile_scope(
+            "offloading_worker.wait", "kv_offload", args={"num_jobs": len(job_ids)}
+        ):
+            for handler in self.handlers:
+                handler.wait(job_ids)
 
     def shutdown(self) -> None:
-        for handler in self.handlers:
-            handler.shutdown()
+        with profile_scope(
+            "offloading_worker.shutdown",
+            "kv_offload",
+            args={"num_handlers": len(self.handlers)},
+        ):
+            for handler in self.handlers:
+                handler.shutdown()

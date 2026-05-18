@@ -10,6 +10,7 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
+from simple_profiler import profile_scope
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
@@ -39,13 +40,14 @@ class KVConnectorModelRunnerMixin:
         scheduler_output: "SchedulerOutput", vllm_config: VllmConfig
     ) -> ModelRunnerOutput:
         # KV send/recv even if no work to do.
-        with (
-            set_forward_context(None, vllm_config),
-            KVConnectorModelRunnerMixin._get_kv_connector_output(
-                scheduler_output, wait_for_save=False
-            ) as kv_connector_output,
-        ):
-            pass
+        with profile_scope("kv_connector.no_forward", "kv_offload"):
+            with (
+                set_forward_context(None, vllm_config),
+                KVConnectorModelRunnerMixin._get_kv_connector_output(
+                    scheduler_output, wait_for_save=False
+                ) as kv_connector_output,
+            ):
+                pass
 
         if kv_connector_output.is_empty():
             return EMPTY_MODEL_RUNNER_OUTPUT
@@ -75,9 +77,14 @@ class KVConnectorModelRunnerMixin:
         Call after draft model forward when defer_finalize=True was used.
         """
         if has_kv_transfer_group():
-            kv_connector = get_kv_transfer_group()
-            kv_connector.wait_for_save()
-            kv_connector.clear_connector_metadata()
+            with profile_scope("kv_connector.finalize", "kv_offload"):
+                kv_connector = get_kv_transfer_group()
+                with profile_scope("kv_connector.finalize.wait_for_save", "kv_offload"):
+                    kv_connector.wait_for_save()
+                with profile_scope(
+                    "kv_connector.finalize.clear_metadata", "kv_offload"
+                ):
+                    kv_connector.clear_connector_metadata()
 
     # This context manager must be used within an active forward context.
     # It encapsulates the entire KV connector lifecycle within execute_model
@@ -92,38 +99,50 @@ class KVConnectorModelRunnerMixin:
         output = KVConnectorOutput()
 
         # Update KVConnector with the KVConnector metadata forward().
-        kv_connector = get_kv_transfer_group()
-        assert isinstance(kv_connector, KVConnectorBase)
-        assert scheduler_output.kv_connector_metadata is not None
-        kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
+        with profile_scope("kv_connector.bind_metadata", "kv_offload"):
+            kv_connector = get_kv_transfer_group()
+            assert isinstance(kv_connector, KVConnectorBase)
+            assert scheduler_output.kv_connector_metadata is not None
+            kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
 
         # Push model-runner-side request TIDs into the connector so KV events
         # appear on the correct per-request tracks.
         if req_profile_tids and hasattr(kv_connector, "set_req_profile_tids"):
-            kv_connector.set_req_profile_tids(req_profile_tids)
+            with profile_scope(
+                "kv_connector.set_req_profile_tids",
+                "kv_offload",
+                args={"num_tids": len(req_profile_tids)},
+            ):
+                kv_connector.set_req_profile_tids(req_profile_tids)
 
         # Background KV cache transfers happen here.
         # These transfers are designed to be async and the requests
         # involved may be disjoint from the running requests.
         # Do this here to save a collective_rpc.
-        kv_connector.start_load_kv(get_forward_context())
+        with profile_scope("kv_connector.start_load_kv", "kv_offload"):
+            kv_connector.start_load_kv(get_forward_context())
         try:
-            yield output
+            with profile_scope("kv_connector.forward_window", "kv_offload"):
+                yield output
         finally:
             if wait_for_save and not defer_finalize:
-                kv_connector.wait_for_save()
+                with profile_scope("kv_connector.wait_for_save", "kv_offload"):
+                    kv_connector.wait_for_save()
 
-            output.finished_sending, output.finished_recving = (
-                kv_connector.get_finished(scheduler_output.finished_req_ids)
-            )
-            output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
+            with profile_scope("kv_connector.get_finished", "kv_offload"):
+                output.finished_sending, output.finished_recving = (
+                    kv_connector.get_finished(scheduler_output.finished_req_ids)
+                )
+            with profile_scope("kv_connector.collect_output", "kv_offload"):
+                output.invalid_block_ids = kv_connector.get_block_ids_with_load_errors()
 
-            output.kv_connector_stats = kv_connector.get_kv_connector_stats()
-            output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
-            output.kv_connector_worker_meta = kv_connector.build_connector_worker_meta()
+                output.kv_connector_stats = kv_connector.get_kv_connector_stats()
+                output.kv_cache_events = kv_connector.get_kv_connector_kv_cache_events()
+                output.kv_connector_worker_meta = kv_connector.build_connector_worker_meta()
 
             if not defer_finalize:
-                kv_connector.clear_connector_metadata()
+                with profile_scope("kv_connector.clear_metadata", "kv_offload"):
+                    kv_connector.clear_connector_metadata()
 
     @staticmethod
     def use_uniform_kv_cache(

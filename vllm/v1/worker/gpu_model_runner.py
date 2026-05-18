@@ -4,7 +4,7 @@
 import functools
 import gc
 
-from simple_profiler import profile_gpu_scope
+from simple_profiler import profile_category, profile_gpu_scope, profile_scope
 import itertools
 import threading
 import time
@@ -1058,6 +1058,7 @@ class GPUModelRunner(
             self.async_output_copy_stream = stream
         return stream
 
+    @profile_category("gpu_runner")
     def _update_states(self, scheduler_output: "SchedulerOutput") -> Callable | None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -1420,6 +1421,7 @@ class GPUModelRunner(
         else:
             return None
 
+    @profile_category("gpu_runner")
     def _update_states_after_model_execute(
         self, output_token_ids: torch.Tensor, scheduler_output: "SchedulerOutput"
     ) -> None:
@@ -1480,6 +1482,7 @@ class GPUModelRunner(
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
 
+    @profile_category("gpu_runner")
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
     ) -> CachedRequestState:
@@ -1621,6 +1624,7 @@ class GPUModelRunner(
         for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
             prev_positions[i] = prev_req_id_to_index.get(req_id, -1)
 
+    @profile_category("gpu_runner")
     def _prepare_input_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1795,6 +1799,7 @@ class GPUModelRunner(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    @profile_category("gpu_runner")
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2668,6 +2673,7 @@ class GPUModelRunner(
             logits_indices=logits_indices,
         )
 
+    @profile_category("gpu_runner")
     def _prepare_kv_sharing_fast_prefill(
         self,
         logits_indices: torch.Tensor,
@@ -2736,6 +2742,7 @@ class GPUModelRunner(
 
         return mm_hashes, mm_kwargs, mm_lora_refs
 
+    @profile_category("gpu_runner")
     def _execute_mm_encoder(
         self, scheduler_output: "SchedulerOutput"
     ) -> list[torch.Tensor]:
@@ -3332,6 +3339,7 @@ class GPUModelRunner(
             ec_connector_output,
         )
 
+    @profile_category("gpu_runner")
     def _sample(
         self,
         logits: torch.Tensor | None,
@@ -3362,6 +3370,7 @@ class GPUModelRunner(
         )
         return sampler_output
 
+    @profile_category("gpu_runner")
     def _bookkeeping_sync(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3783,6 +3792,7 @@ class GPUModelRunner(
         return slot_mappings_by_gid, slot_mappings_by_layer
 
     @torch.inference_mode()
+    @profile_category("gpu_runner")
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3790,6 +3800,13 @@ class GPUModelRunner(
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
         step = self._profile_step
         self._profile_step += 1
+        execute_args = {
+            "step": step,
+            "num_scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
+            "num_scheduled_reqs": len(scheduler_output.num_scheduled_tokens),
+            "num_new_reqs": len(scheduler_output.scheduled_new_reqs),
+            "has_kv_connector": has_kv_transfer_group(),
+        }
         if self.execute_model_state is not None:
             raise RuntimeError(
                 "State error: sample_tokens() must be called "
@@ -3823,15 +3840,22 @@ class GPUModelRunner(
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             assert kv_connector_metadata is not None
-            get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+            with profile_scope(
+                "gpu_runner.handle_preemptions_before_preprocess",
+                "kv_offload",
+                args=execute_args,
+            ):
+                get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with (
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
+            profile_scope("gpu_runner.preprocess", "gpu_runner", args=execute_args),
         ):
             # Update persistent batch states.
-            deferred_state_corrections_fn = self._update_states(scheduler_output)
+            with profile_scope("gpu_runner.update_states_call", "gpu_runner"):
+                deferred_state_corrections_fn = self._update_states(scheduler_output)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -3857,7 +3881,10 @@ class GPUModelRunner(
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                with profile_scope("gpu_runner.kv_connector_no_forward", "kv_offload"):
+                    return self.kv_connector_no_forward(
+                        scheduler_output, self.vllm_config
+                    )
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -3873,35 +3900,45 @@ class GPUModelRunner(
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-            logits_indices, spec_decode_metadata = self._prepare_inputs(
-                scheduler_output,
-                num_scheduled_tokens_np,
-            )
+            with profile_scope(
+                "gpu_runner.prepare_inputs_call",
+                "gpu_runner",
+                args={"num_reqs": num_reqs, "num_tokens": num_tokens_unpadded},
+            ):
+                logits_indices, spec_decode_metadata = self._prepare_inputs(
+                    scheduler_output,
+                    num_scheduled_tokens_np,
+                )
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
             if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
                 # Pre-compute cascade attention prefix lengths
-                cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
-                    num_scheduled_tokens_np,
-                    self.input_batch.num_computed_tokens_cpu[:num_reqs],
-                    scheduler_output.num_common_prefix_blocks,
-                )
+                with profile_scope("gpu_runner.compute_cascade_attn_prefix_lens", "gpu_runner"):
+                    cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
+                        num_scheduled_tokens_np,
+                        self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                        scheduler_output.num_common_prefix_blocks,
+                    )
 
-            (
-                cudagraph_mode,
-                batch_desc,
-                should_ubatch,
-                num_tokens_across_dp,
-                cudagraph_stats,
-            ) = self._determine_batch_execution_and_padding(
-                num_tokens=num_tokens_unpadded,
-                num_reqs=num_reqs,
-                num_scheduled_tokens_np=num_scheduled_tokens_np,
-                max_num_scheduled_tokens=max_num_scheduled_tokens,
-                use_cascade_attn=cascade_attn_prefix_lens is not None,
-                num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
-            )
+            with profile_scope(
+                "gpu_runner.determine_batch_execution_and_padding",
+                "gpu_runner",
+            ):
+                (
+                    cudagraph_mode,
+                    batch_desc,
+                    should_ubatch,
+                    num_tokens_across_dp,
+                    cudagraph_stats,
+                ) = self._determine_batch_execution_and_padding(
+                    num_tokens=num_tokens_unpadded,
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens_np=num_scheduled_tokens_np,
+                    max_num_scheduled_tokens=max_num_scheduled_tokens,
+                    use_cascade_attn=cascade_attn_prefix_lens is not None,
+                    num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                )
 
             logger.debug(
                 "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -3916,13 +3953,18 @@ class GPUModelRunner(
             num_reqs_padded = (
                 batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
             )
-            ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
-                should_ubatch,
-                num_scheduled_tokens_np,
-                num_tokens_padded,
-                num_reqs_padded,
-                self.parallel_config.num_ubatches,
-            )
+            with profile_scope(
+                "gpu_runner.maybe_create_ubatch_slices",
+                "gpu_runner",
+                args={"should_ubatch": should_ubatch},
+            ):
+                ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
+                    should_ubatch,
+                    num_scheduled_tokens_np,
+                    num_tokens_padded,
+                    num_reqs_padded,
+                    self.parallel_config.num_ubatches,
+                )
 
             logger.debug(
                 "ubatch_slices: %s, ubatch_slices_padded: %s",
@@ -3948,19 +3990,24 @@ class GPUModelRunner(
                 # to decide copy operations, so we must apply deferred
                 # corrections before it runs.
                 if deferred_state_corrections_fn:
-                    deferred_state_corrections_fn()
+                    with profile_scope(
+                        "gpu_runner.apply_deferred_state_corrections_before_mamba",
+                        "gpu_runner",
+                    ):
+                        deferred_state_corrections_fn()
                     deferred_state_corrections_fn = None
-                mamba_utils.preprocess_mamba(
-                    scheduler_output,
-                    self.kv_cache_config,
-                    self.cache_config,
-                    self.mamba_state_idx,
-                    self.input_batch,
-                    self.requests,
-                    self.compilation_config.static_forward_context,
-                    self.model.get_mamba_state_copy_func(),
-                    self._get_mamba_copy_bufs(),
-                )
+                with profile_scope("gpu_runner.preprocess_mamba", "gpu_runner"):
+                    mamba_utils.preprocess_mamba(
+                        scheduler_output,
+                        self.kv_cache_config,
+                        self.cache_config,
+                        self.mamba_state_idx,
+                        self.input_batch,
+                        self.requests,
+                        self.compilation_config.static_forward_context,
+                        self.model.get_mamba_state_copy_func(),
+                        self._get_mamba_copy_bufs(),
+                    )
                 # preprocess_mamba resets num_accepted_tokens_cpu to 1
                 # for requests whose state was copied to a new block.
                 # Re-sync to GPU so the mamba kernel reads from the
@@ -3973,43 +4020,54 @@ class GPUModelRunner(
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
-            slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
-                num_tokens_padded=num_tokens_padded
-                if pad_attn or has_separate_kv_update
-                else num_tokens_unpadded,
-                num_reqs_padded=(
-                    num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
-                ),
-                num_tokens_unpadded=num_tokens_unpadded,
-                ubatch_slices=ubatch_slices_padded,
-            )
-
-            attn_metadata, spec_decode_common_attn_metadata = (
-                self._build_attention_metadata(
-                    num_tokens=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded if pad_attn else None,
-                    num_reqs=num_reqs,
-                    num_reqs_padded=num_reqs_padded if pad_attn else None,
-                    max_query_len=max_num_scheduled_tokens,
-                    ubatch_slices=ubatch_slices_attn,
-                    logits_indices=logits_indices,
-                    use_spec_decode=use_spec_decode,
-                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
-                    slot_mappings=slot_mappings_by_group,
+            with profile_scope(
+                "gpu_runner.get_slot_mappings",
+                "gpu_runner",
+                args={"pad_attn": pad_attn, "separate_kv_update": has_separate_kv_update},
+            ):
+                slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
+                    num_tokens_padded=num_tokens_padded
+                    if pad_attn or has_separate_kv_update
+                    else num_tokens_unpadded,
+                    num_reqs_padded=(
+                        num_reqs_padded if pad_attn or has_separate_kv_update else num_reqs
+                    ),
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    ubatch_slices=ubatch_slices_padded,
                 )
-            )
 
-            (
-                input_ids,
-                inputs_embeds,
-                positions,
-                intermediate_tensors,
-                model_kwargs,
-                ec_connector_output,
-            ) = self._preprocess(
-                scheduler_output, num_tokens_padded, intermediate_tensors
-            )
+            with profile_scope(
+                "gpu_runner.build_attention_metadata",
+                "gpu_runner",
+                args={"use_spec_decode": use_spec_decode},
+            ):
+                attn_metadata, spec_decode_common_attn_metadata = (
+                    self._build_attention_metadata(
+                        num_tokens=num_tokens_unpadded,
+                        num_tokens_padded=num_tokens_padded if pad_attn else None,
+                        num_reqs=num_reqs,
+                        num_reqs_padded=num_reqs_padded if pad_attn else None,
+                        max_query_len=max_num_scheduled_tokens,
+                        ubatch_slices=ubatch_slices_attn,
+                        logits_indices=logits_indices,
+                        use_spec_decode=use_spec_decode,
+                        num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                        cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                        slot_mappings=slot_mappings_by_group,
+                    )
+                )
+
+            with profile_scope("gpu_runner.preprocess_model_inputs", "gpu_runner"):
+                (
+                    input_ids,
+                    inputs_embeds,
+                    positions,
+                    intermediate_tensors,
+                    model_kwargs,
+                    ec_connector_output,
+                ) = self._preprocess(
+                    scheduler_output, num_tokens_padded, intermediate_tensors
+                )
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -4053,6 +4111,12 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            with profile_scope(
+                "gpu_runner.forward_context_to_forward_entry",
+                "kv_offload",
+                args=execute_args,
+            ):
+                pass
             with profile_gpu_scope(f"forward(step={step})", "model",
                                    tids=_active_tids or None):
                 model_output = self._model_forward(
@@ -4063,7 +4127,10 @@ class GPUModelRunner(
                     **model_kwargs,
                 )
 
-        with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+        with (
+            record_function_or_nullcontext("gpu_model_runner: postprocess"),
+            profile_scope("gpu_runner.postprocess", "gpu_runner", args=execute_args),
+        ):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
@@ -4083,15 +4150,17 @@ class GPUModelRunner(
 
                 if self.is_pooling_model:
                     # Return the pooling output.
-                    return self._pool(
-                        hidden_states,
-                        num_scheduled_tokens,
-                        num_scheduled_tokens_np,
-                        kv_connector_output,
-                    )
+                    with profile_scope("gpu_runner.pool", "gpu_runner"):
+                        return self._pool(
+                            hidden_states,
+                            num_scheduled_tokens,
+                            num_scheduled_tokens_np,
+                            kv_connector_output,
+                        )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                with profile_gpu_scope(f"compute_logits(step={step})", "model"):
+                    logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4110,7 +4179,8 @@ class GPUModelRunner(
                     )
                     logits = None
                 else:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                    with profile_gpu_scope(f"compute_logits(step={step})", "model"):
+                        logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -4140,11 +4210,16 @@ class GPUModelRunner(
         # Now the batch has been launched we can wait for corrections from the
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
-            deferred_state_corrections_fn()
+            with profile_scope(
+                "gpu_runner.apply_deferred_state_corrections_after_forward",
+                "gpu_runner",
+            ):
+                deferred_state_corrections_fn()
 
         return None
 
     @torch.inference_mode
+    @profile_category("gpu_runner")
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:

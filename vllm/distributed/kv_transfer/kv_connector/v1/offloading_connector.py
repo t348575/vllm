@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
+from simple_profiler import profile_category, profile_scope
 
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import KVCacheEvent
@@ -66,11 +67,13 @@ class OffloadingConnector(KVConnectorBase_V1):
             self.connector_worker = OffloadingConnectorWorker(spec)
 
     def shutdown(self) -> None:
-        if self.connector_worker is not None:
-            self.connector_worker.shutdown()
-        if self.connector_scheduler is not None:
-            self.connector_scheduler.shutdown()
+        with profile_scope("offloading_connector.shutdown", "kv_offload"):
+            if self.connector_worker is not None:
+                self.connector_worker.shutdown()
+            if self.connector_scheduler is not None:
+                self.connector_scheduler.shutdown()
 
+    @profile_category("kv_offload")
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
@@ -81,11 +84,13 @@ class OffloadingConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         self.connector_worker.register_cross_layers_kv_cache(kv_cache, attn_backend)
 
+    @profile_category("kv_offload")
     def handle_preemptions(self, kv_connector_metadata: KVConnectorMetadata):
         assert self.connector_worker is not None
         assert isinstance(kv_connector_metadata, OffloadingConnectorMetadata)
         self.connector_worker.handle_preemptions(kv_connector_metadata)
 
+    @profile_category("kv_offload")
     def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
@@ -103,15 +108,18 @@ class OffloadingConnector(KVConnectorBase_V1):
     ) -> None:
         pass
 
+    @profile_category("kv_offload")
     def wait_for_save(self):
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
         self.connector_worker.prepare_store_kv(self._connector_metadata)
 
+    @profile_category("kv_offload")
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert self.connector_worker is not None
         return self.connector_worker.get_finished(finished_req_ids)
 
+    @profile_category("kv_offload")
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
@@ -120,6 +128,7 @@ class OffloadingConnector(KVConnectorBase_V1):
             request, num_computed_tokens
         )
 
+    @profile_category("kv_offload")
     def update_state_after_alloc(
         self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int
     ):
@@ -128,16 +137,19 @@ class OffloadingConnector(KVConnectorBase_V1):
             request, blocks, num_external_tokens
         )
 
+    @profile_category("kv_offload")
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.build_connector_meta(scheduler_output)
 
+    @profile_category("kv_offload")
     def update_connector_output(self, connector_output: KVConnectorOutput):
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)
 
+    @profile_category("kv_offload")
     def request_finished(
         self,
         request: "Request",
@@ -146,6 +158,7 @@ class OffloadingConnector(KVConnectorBase_V1):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
+    @profile_category("kv_offload")
     def take_events(self) -> Iterable[KVCacheEvent]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.take_events()
@@ -160,9 +173,10 @@ class OffloadingConnector(KVConnectorBase_V1):
             self.connector_worker.set_req_profile_tids(tid_map)
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
-        if self.connector_worker is None:
-            return None  # We only emit stats from the worker-side
-        return self.connector_worker.get_kv_connector_stats()
+        with profile_scope("offloading_connector.get_kv_connector_stats", "kv_offload"):
+            if self.connector_worker is None:
+                return None  # We only emit stats from the worker-side
+            return self.connector_worker.get_kv_connector_stats()
 
     @classmethod
     def build_kv_connector_stats(
