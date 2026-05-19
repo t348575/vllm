@@ -364,6 +364,14 @@ class OffloadingConnectorWorker:
         load_req_ids = set(metadata.reqs_to_load)
         for req_id, src_spec in (metadata.reqs_to_prefetch or {}).items():
             if req_id in load_req_ids:
+                profiler.add_event(
+                    name="offload_worker.prefetch_skipped_same_step",
+                    category="kv_offload",
+                    start_ns=time.perf_counter_ns(),
+                    duration_ns=0,
+                    tid=self._req_profile_tid.get(req_id, "kv_prefetch"),
+                    args={"req_id": req_id},
+                )
                 continue
             prefetch_id = getattr(src_spec, "prefetch_id", None)
             if not prefetch_id:
@@ -375,8 +383,9 @@ class OffloadingConnectorWorker:
                 continue
             start_ns = time.perf_counter_ns()
             tid = self._get_or_alloc_req_tid(req_id, start_ns)
+            submitted = False
             try:
-                handler.prefetch_async(
+                submitted = handler.prefetch_async(
                     prefetch_id, src_spec, profile_tid=tid, req_id=req_id
                 )
             except Exception:
@@ -386,6 +395,18 @@ class OffloadingConnectorWorker:
                     req_id,
                     exc_info=True,
                 )
+            profiler.add_event(
+                name="offload_worker.submit_prefetch",
+                category="kv_offload",
+                start_ns=start_ns,
+                duration_ns=time.perf_counter_ns() - start_ns,
+                tid=tid,
+                args={
+                    "req_id": req_id,
+                    "prefetch_id": prefetch_id,
+                    "submitted": submitted,
+                },
+            )
 
         for req_id, transfer_spec in metadata.reqs_to_load.items():
             job_id = self._generate_job_id()
@@ -420,7 +441,28 @@ class OffloadingConnectorWorker:
                             req_id,
                             exc_info=True,
                         )
+                    profiler.add_event(
+                        name="offload_worker.submit_prefetch_placement",
+                        category="kv_offload",
+                        start_ns=load_start_ns,
+                        duration_ns=time.perf_counter_ns() - load_start_ns,
+                        tid=tid,
+                        args={
+                            "req_id": req_id,
+                            "prefetch_id": prefetch_id,
+                            "submitted": success,
+                        },
+                    )
             if not success:
+                if prefetch_id:
+                    profiler.add_event(
+                        name="offload_worker.prefetch_fallback",
+                        category="kv_offload",
+                        start_ns=time.perf_counter_ns(),
+                        duration_ns=0,
+                        tid=tid,
+                        args={"req_id": req_id, "prefetch_id": prefetch_id},
+                    )
                 success = self.worker.transfer_async(
                     job_id, transfer_spec, profile_tid=tid, req_id=req_id
                 )
