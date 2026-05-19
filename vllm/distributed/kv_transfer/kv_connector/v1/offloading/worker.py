@@ -336,6 +336,8 @@ class OffloadingConnectorWorker:
         step = self._profile_step
         self._profile_step += 1
         with profile_scope(f"handle_preemptions(step={step})"):
+            self._submit_prefetches(kv_connector_metadata)
+
             for job_id, transfer_spec in self._unsubmitted_store_jobs:
                 req_id, _ = self._jobs[job_id]
                 tid = self._req_profile_tid.get(req_id, "kv_store")
@@ -350,29 +352,8 @@ class OffloadingConnectorWorker:
                 if job_ids:
                     self.worker.wait(job_ids)
 
-    def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
-        self._profile_step += 1
-        for job_id, transfer_spec in self._unsubmitted_store_jobs:
-            req_id, _ = self._jobs[job_id]
-            tid = self._req_profile_tid.get(req_id, "kv_store")
-            success = self.worker.transfer_async(
-                job_id, transfer_spec, profile_tid=tid, req_id=req_id
-            )
-            assert success
-        self._unsubmitted_store_jobs.clear()
-
-        load_req_ids = set(metadata.reqs_to_load)
+    def _submit_prefetches(self, metadata: OffloadingConnectorMetadata) -> None:
         for req_id, src_spec in (metadata.reqs_to_prefetch or {}).items():
-            if req_id in load_req_ids:
-                profiler.add_event(
-                    name="offload_worker.prefetch_skipped_same_step",
-                    category="kv_offload",
-                    start_ns=time.perf_counter_ns(),
-                    duration_ns=0,
-                    tid=self._req_profile_tid.get(req_id, "kv_prefetch"),
-                    args={"req_id": req_id},
-                )
-                continue
             prefetch_id = getattr(src_spec, "prefetch_id", None)
             if not prefetch_id:
                 continue
@@ -407,6 +388,22 @@ class OffloadingConnectorWorker:
                     "submitted": submitted,
                 },
             )
+
+    def start_kv_transfers(self, metadata: OffloadingConnectorMetadata):
+        self._profile_step += 1
+        for job_id, transfer_spec in self._unsubmitted_store_jobs:
+            req_id, _ = self._jobs[job_id]
+            tid = self._req_profile_tid.get(req_id, "kv_store")
+            success = self.worker.transfer_async(
+                job_id, transfer_spec, profile_tid=tid, req_id=req_id
+            )
+            assert success
+        self._unsubmitted_store_jobs.clear()
+
+        # Fallback for worker paths that call start_load_kv without a prior
+        # handle_preemptions call. Duplicate submissions are de-duplicated by
+        # the storage handler and do not issue a second read.
+        self._submit_prefetches(metadata)
 
         for req_id, transfer_spec in metadata.reqs_to_load.items():
             job_id = self._generate_job_id()
