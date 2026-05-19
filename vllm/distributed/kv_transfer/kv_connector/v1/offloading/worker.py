@@ -356,7 +356,14 @@ class OffloadingConnectorWorker:
         step = self._profile_step
         self._profile_step += 1
         with profile_scope(f"handle_preemptions(step={step})"):
-            self._submit_prefetches(kv_connector_metadata)
+            with profile_scope(
+                "handle_preemptions.submit_prefetches",
+                "kv_offload",
+                args={
+                    "num_jobs": len(kv_connector_metadata.reqs_to_prefetch or {})
+                },
+            ):
+                self._submit_prefetches(kv_connector_metadata)
 
             for job_id, transfer_spec in self._unsubmitted_store_jobs:
                 req_id, _ = self._jobs[job_id]

@@ -207,6 +207,7 @@ class OffloadingConnectorScheduler:
             reason: str,
             hits: int | None = None,
             start_block_idx: int | None = None,
+            prefetch_queued: bool = False,
         ) -> tuple[int | None, bool]:
             if profiler._active:
                 profiler.add_event(
@@ -223,6 +224,8 @@ class OffloadingConnectorScheduler:
                         "reason": reason,
                         "hits": hits,
                         "start_block_idx": start_block_idx,
+                        "prefetch_enabled": self.enable_prefetch,
+                        "prefetch_queued": prefetch_queued,
                     },
                 )
             return matched_tokens, load_async
@@ -312,6 +315,7 @@ class OffloadingConnectorScheduler:
             )
             return finish(None, False, "already_loading", hits, start_block_idx)
 
+        prefetch_queued = False
         if self.enable_prefetch:
             hit_keys = tuple(offload_keys[start_block_idx : start_block_idx + hits])
             existing = self._req_prefetch_specs.get(request.request_id)
@@ -323,9 +327,34 @@ class OffloadingConnectorScheduler:
                     self._make_prefetch_id(request.request_id, start_block_idx, hits),
                 )
                 self._req_prefetch_specs[request.request_id] = (hit_keys, src_spec)
-                self._reqs_to_prefetch[request.request_id] = src_spec
+            else:
+                src_spec = existing[1]
+            self._reqs_to_prefetch[request.request_id] = src_spec
+            prefetch_queued = True
 
-        return finish(num_hit_tokens, True, "hit", hits, start_block_idx)
+        if profiler._active:
+            profiler.add_event(
+                "offload_scheduler.prefetch_decision",
+                "kv_offload",
+                time.perf_counter_ns(),
+                0,
+                args={
+                    "req_id": request.request_id,
+                    "enabled": self.enable_prefetch,
+                    "queued": prefetch_queued,
+                    "hits": hits,
+                    "start_block_idx": start_block_idx,
+                },
+            )
+
+        return finish(
+            num_hit_tokens,
+            True,
+            "hit",
+            hits,
+            start_block_idx,
+            prefetch_queued,
+        )
 
     def update_state_after_alloc(
         self, request: Request, blocks: KVCacheBlocks, num_external_tokens: int
