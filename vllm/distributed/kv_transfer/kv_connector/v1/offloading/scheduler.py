@@ -17,6 +17,7 @@ from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_offload.abstract import (
+    LoadStoreSpec,
     OffloadingManager,
     OffloadKey,
     get_offload_block_hash,
@@ -115,10 +116,17 @@ class OffloadingConnectorScheduler:
     def __init__(self, spec: OffloadingSpec):
         self.config = SchedulerOffloadConfig.from_spec(spec)
         self.manager: OffloadingManager = spec.get_manager()
+        self.enable_prefetch = str(
+            spec.extra_config.get("enable_kv_offload_prefetch", "false")
+        ).lower() in {"1", "true", "yes", "on"}
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         # requests to load for the current scheduler step
         self._reqs_to_load: dict[ReqId, TransferSpec] = {}
+        self._reqs_to_prefetch: dict[ReqId, LoadStoreSpec] = {}
+        self._req_prefetch_specs: dict[
+            ReqId, tuple[tuple[OffloadKey, ...], LoadStoreSpec]
+        ] = {}
         # if GPU prefix caching is enabled,
         # track loaded blocks to avoid redundant loads
         self._blocks_being_loaded: set[OffloadKey] | None = (
@@ -128,6 +136,10 @@ class OffloadingConnectorScheduler:
         # request ID -> set(offload keys being stored/loaded)
         self._reqs_being_stored = defaultdict[ReqId, set[OffloadKey]](set)
         self._reqs_being_loaded = defaultdict[ReqId, set[OffloadKey]](set)
+
+    @staticmethod
+    def _make_prefetch_id(req_id: ReqId, start_block_idx: int, num_blocks: int) -> str:
+        return f"{req_id}:{start_block_idx}:{num_blocks}"
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -212,6 +224,19 @@ class OffloadingConnectorScheduler:
             )
             return None, False
 
+        if self.enable_prefetch:
+            hit_keys = tuple(offload_keys[start_block_idx : start_block_idx + hits])
+            existing = self._req_prefetch_specs.get(request.request_id)
+            if existing is None or existing[0] != hit_keys:
+                src_spec = self.manager.prepare_load(hit_keys)
+                setattr(
+                    src_spec,
+                    "prefetch_id",
+                    self._make_prefetch_id(request.request_id, start_block_idx, hits),
+                )
+                self._req_prefetch_specs[request.request_id] = (hit_keys, src_spec)
+                self._reqs_to_prefetch[request.request_id] = src_spec
+
         return num_hit_tokens, True
 
     def update_state_after_alloc(
@@ -249,7 +274,16 @@ class OffloadingConnectorScheduler:
         assert len(request.block_hashes) // self.config.block_size_factor >= num_blocks
         offload_keys = group_state.offload_keys[start_block_idx:num_blocks]
 
-        src_spec = self.manager.prepare_load(offload_keys)
+        offload_keys_tuple = tuple(offload_keys)
+        prefetch = self._req_prefetch_specs.get(request.request_id)
+        if (
+            self.enable_prefetch
+            and prefetch is not None
+            and prefetch[0] == offload_keys_tuple
+        ):
+            src_spec = prefetch[1]
+        else:
+            src_spec = self.manager.prepare_load(offload_keys_tuple)
         dst_spec = GPULoadStoreSpec(
             block_ids[num_computed_gpu_blocks:],
             group_sizes=(num_pending_gpu_blocks,),
@@ -350,9 +384,11 @@ class OffloadingConnectorScheduler:
         meta = OffloadingConnectorMetadata(
             reqs_to_load=self._reqs_to_load,
             reqs_to_store=self._get_reqs_to_store(scheduler_output),
+            reqs_to_prefetch=self._reqs_to_prefetch or None,
             reqs_to_flush=scheduler_output.preempted_req_ids,
         )
         self._reqs_to_load = {}
+        self._reqs_to_prefetch = {}
 
         # NOTE (orozery): we should move this logic to update_connector_output
         # once KVConnectorOutput allows us to report completed transfers
@@ -361,6 +397,7 @@ class OffloadingConnectorScheduler:
             if keys:
                 self.manager.complete_store(keys)
                 keys.clear()
+            self._req_prefetch_specs.pop(req_id, None)
 
         return meta
 
@@ -404,6 +441,8 @@ class OffloadingConnectorScheduler:
         # TODO(orozery): possibly kickoff offload for last block
         # which may have been deferred due to async scheduling
         self._req_status.pop(req_id, None)
+        self._req_prefetch_specs.pop(req_id, None)
+        self._reqs_to_prefetch.pop(req_id, None)
 
         request_being_stored = req_id in self._reqs_being_stored
         return request_being_stored, None

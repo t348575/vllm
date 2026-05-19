@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+from vllm.v1.kv_offload.abstract import LoadStoreSpec
 from vllm.v1.kv_offload.worker.worker import TransferSpec
 
 ReqId = str
@@ -12,4 +13,5 @@ ReqId = str
 class OffloadingConnectorMetadata(KVConnectorMetadata):
     reqs_to_load: dict[ReqId, TransferSpec]
     reqs_to_store: dict[ReqId, TransferSpec]
+    reqs_to_prefetch: dict[ReqId, LoadStoreSpec] | None = None
     reqs_to_flush: set[str] | None = None
