@@ -11,6 +11,7 @@ from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.v1 import (
     KVConnectorBase_V1,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
@@ -22,6 +23,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMessageMetadata,
+    OffloadingWorkerMetadata,
     ReqId,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
@@ -44,7 +46,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 
-class OffloadingConnector(KVConnectorBase_V1):
+class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     @property
     def prefer_cross_layer_blocks(self) -> bool:
         return True
@@ -53,11 +55,10 @@ class OffloadingConnector(KVConnectorBase_V1):
         self,
         vllm_config: VllmConfig,
         role: KVConnectorRole,
-        kv_cache_config: KVCacheConfig | None = None,
+        kv_cache_config: KVCacheConfig,
     ):
         super().__init__(vllm_config, role, kv_cache_config)
 
-        assert kv_cache_config is not None
         spec = OffloadingSpecFactory.create_spec(vllm_config, kv_cache_config)
 
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
@@ -99,14 +100,19 @@ class OffloadingConnector(KVConnectorBase_V1):
     ) -> KVConnectorMetadata | None:
         assert self.connector_scheduler is not None
         assert isinstance(connector_metadata, OffloadingConnectorMetadata)
-        if not connector_metadata.reqs_to_load:
+        if not connector_metadata.load_jobs:
             return None
 
-        reqs_to_load = connector_metadata.reqs_to_load
-        connector_metadata.reqs_to_load = {}
+        # Split the load jobs (and any preload hints) into an early metadata so
+        # the worker can start reads before the store/flush jobs are handled.
+        load_jobs = connector_metadata.load_jobs
+        reqs_to_preload = connector_metadata.reqs_to_preload
+        connector_metadata.load_jobs = {}
+        connector_metadata.reqs_to_preload = None
         return OffloadingConnectorMetadata(
-            reqs_to_load=reqs_to_load,
-            reqs_to_store={},
+            load_jobs=load_jobs,
+            store_jobs={},
+            reqs_to_preload=reqs_to_preload,
         )
 
     def handle_worker_message_from_metadata(
@@ -133,13 +139,25 @@ class OffloadingConnector(KVConnectorBase_V1):
         pass
 
     def wait_for_save(self):
-        assert self.connector_worker is not None
-        assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
-        self.connector_worker.prepare_store_kv(self._connector_metadata)
+        # Store deferral is handled in get_finished(), which always runs even
+        # when wait_for_save() is skipped (e.g. kv_connector_no_forward).
+        pass
 
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         assert self.connector_worker is not None
+        assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
+
+        # Defer store jobs to the next step's start_kv_transfers. Done here
+        # (rather than wait_for_save) so stores are queued even on steps where
+        # wait_for_save is skipped.
+        self.connector_worker.prepare_store_kv(self._connector_metadata)
+
         return self.connector_worker.get_finished(finished_req_ids)
+
+    def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
+        if self.connector_worker is not None:
+            return self.connector_worker.build_connector_worker_meta()
+        return None
 
     @profile_category("kv_offload")
     def get_num_new_matched_tokens(
@@ -174,7 +192,15 @@ class OffloadingConnector(KVConnectorBase_V1):
         block_ids: list[int],
     ) -> tuple[bool, dict[str, Any] | None]:
         assert self.connector_scheduler is not None
-        return self.connector_scheduler.request_finished(request, block_ids)
+        return self.connector_scheduler.request_finished(request)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.request_finished(request)
 
     def take_events(self) -> Iterable[KVCacheEvent]:
         assert self.connector_scheduler is not None
@@ -188,6 +214,15 @@ class OffloadingConnector(KVConnectorBase_V1):
     def set_req_profile_tids(self, tid_map: dict) -> None:
         if self.connector_worker is not None:
             self.connector_worker.set_req_profile_tids(tid_map)
+
+    @classmethod
+    def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
+        return "HND"
+
+    def reset_cache(self) -> bool | None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.reset_cache()
+        return True
 
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         if self.connector_worker is None:
