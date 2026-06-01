@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from typing import Any
 
 from simple_profiler import profile_scope
 
@@ -165,6 +166,20 @@ class OffloadingWorker:
                 logger.debug("Submitted %r transfer %d: %r", transfer_type, job_id, spec)
             return success
 
+    def handle_worker_message(self, message: Any) -> bool:
+        with profile_scope(
+            "offloading_worker.handle_worker_message",
+            "kv_offload",
+            args={"num_handlers": len(self.handlers)},
+        ):
+            for handler in self.handlers:
+                handle_message = getattr(handler, "handle_worker_message", None)
+                if handle_message is None:
+                    continue
+                if handle_message(message):
+                    return True
+        return False
+
     def get_finished(self) -> list[TransferResult]:
         """
         Get transfers finished since last call.
@@ -196,10 +211,5 @@ class OffloadingWorker:
                 handler.wait(job_ids)
 
     def shutdown(self) -> None:
-        with profile_scope(
-            "offloading_worker.shutdown",
-            "kv_offload",
-            args={"num_handlers": len(self.handlers)},
-        ):
-            for handler in self.handlers:
-                handler.shutdown()
+        for handler in self.handlers:
+            handler.shutdown()

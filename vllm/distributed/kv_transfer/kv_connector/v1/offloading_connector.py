@@ -21,6 +21,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
+    OffloadingWorkerMessageMetadata,
     ReqId,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
@@ -67,11 +68,10 @@ class OffloadingConnector(KVConnectorBase_V1):
             self.connector_worker = OffloadingConnectorWorker(spec)
 
     def shutdown(self) -> None:
-        with profile_scope("offloading_connector.shutdown", "kv_offload"):
-            if self.connector_worker is not None:
-                self.connector_worker.shutdown()
-            if self.connector_scheduler is not None:
-                self.connector_scheduler.shutdown()
+        if self.connector_worker is not None:
+            self.connector_worker.shutdown()
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.shutdown()
 
     @profile_category("kv_offload")
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -95,6 +95,33 @@ class OffloadingConnector(KVConnectorBase_V1):
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
         self.connector_worker.start_kv_transfers(self._connector_metadata)
+
+    def take_early_load_metadata(
+        self, connector_metadata: KVConnectorMetadata
+    ) -> KVConnectorMetadata | None:
+        assert self.connector_scheduler is not None
+        assert isinstance(connector_metadata, OffloadingConnectorMetadata)
+        if not connector_metadata.reqs_to_load:
+            return None
+
+        reqs_to_load = connector_metadata.reqs_to_load
+        connector_metadata.reqs_to_load = {}
+        return OffloadingConnectorMetadata(
+            reqs_to_load=reqs_to_load,
+            reqs_to_store={},
+        )
+
+    @profile_category("kv_offload")
+    def handle_worker_message_from_metadata(
+        self, connector_metadata: KVConnectorMetadata
+    ) -> bool:
+        assert self.connector_worker is not None
+        assert isinstance(connector_metadata, OffloadingWorkerMessageMetadata)
+        return self.connector_worker.handle_worker_message(connector_metadata)
+
+    def set_worker_message_callback(self, callback: Any | None) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.set_worker_message_callback(callback)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass

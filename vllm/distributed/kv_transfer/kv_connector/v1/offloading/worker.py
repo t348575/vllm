@@ -13,6 +13,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
+    OffloadingWorkerMessageMetadata,
     ReqId,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
@@ -357,13 +358,13 @@ class OffloadingConnectorWorker:
         self._profile_step += 1
         with profile_scope(f"handle_preemptions(step={step})"):
             with profile_scope(
-                "handle_preemptions.submit_prefetches",
+                "handle_preemptions.submit_preloads",
                 "kv_offload",
                 args={
-                    "num_jobs": len(kv_connector_metadata.reqs_to_prefetch or {})
+                    "num_jobs": len(kv_connector_metadata.reqs_to_preload or {})
                 },
             ):
-                self._submit_prefetches(kv_connector_metadata)
+                self._submit_preloads(kv_connector_metadata)
 
             for job_id, transfer_spec in self._unsubmitted_store_jobs:
                 req_id, _ = self._jobs[job_id]
@@ -379,39 +380,39 @@ class OffloadingConnectorWorker:
                 if job_ids:
                     self.worker.wait(job_ids)
 
-    def _submit_prefetches(self, metadata: OffloadingConnectorMetadata) -> None:
-        for req_id, src_spec in (metadata.reqs_to_prefetch or {}).items():
-            prefetch_id = getattr(src_spec, "prefetch_id", None)
-            if not prefetch_id:
+    def _submit_preloads(self, metadata: OffloadingConnectorMetadata) -> None:
+        for req_id, src_spec in (metadata.reqs_to_preload or {}).items():
+            preload_id = getattr(src_spec, "preload_id", None)
+            if not preload_id:
                 continue
             handler = self.worker.transfer_type_to_handler.get(
                 (src_spec.medium(), GPULoadStoreSpec.medium())
             )
-            if handler is None or not hasattr(handler, "prefetch_async"):
+            if handler is None or not hasattr(handler, "preload_async"):
                 continue
             start_ns = time.perf_counter_ns()
             tid = self._get_or_alloc_req_tid(req_id, start_ns)
             submitted = False
             try:
-                submitted = handler.prefetch_async(
-                    prefetch_id, src_spec, profile_tid=tid, req_id=req_id
+                submitted = handler.preload_async(
+                    preload_id, src_spec, profile_tid=tid, req_id=req_id
                 )
             except Exception:
                 logger.warning(
-                    "Failed to submit KV offload prefetch %s for request %s",
-                    prefetch_id,
+                    "Failed to submit KV offload preload %s for request %s",
+                    preload_id,
                     req_id,
                     exc_info=True,
                 )
             profiler.add_event(
-                name="offload_worker.submit_prefetch",
+                name="offload_worker.submit_preload",
                 category="kv_offload",
                 start_ns=start_ns,
                 duration_ns=time.perf_counter_ns() - start_ns,
                 tid=tid,
                 args={
                     "req_id": req_id,
-                    "prefetch_id": prefetch_id,
+                    "preload_id": preload_id,
                     "submitted": submitted,
                 },
             )
@@ -449,12 +450,20 @@ class OffloadingConnectorWorker:
             # handle_preemptions call. Duplicate submissions are de-duplicated by
             # the storage handler and do not issue a second read.
             with profile_scope(
-                "start_kv_transfers.submit_prefetches",
+                "start_kv_transfers.submit_preloads",
                 "kv_offload",
-                args={"num_jobs": len(metadata.reqs_to_prefetch or {})},
+                args={"num_jobs": len(metadata.reqs_to_preload or {})},
             ):
-                self._submit_prefetches(metadata)
+                self._submit_preloads(metadata)
 
+            self.start_loads(metadata)
+
+    def start_loads(self, metadata: OffloadingConnectorMetadata):
+        with profile_scope(
+            "offload_worker.start_loads",
+            "kv_offload",
+            args={"num_jobs": len(metadata.reqs_to_load)},
+        ):
             with profile_scope(
                 f"start_kv_transfers.submit_loads(step={self._profile_step})",
                 "kv_offload",
@@ -470,27 +479,27 @@ class OffloadingConnectorWorker:
                     tid = self._get_or_alloc_req_tid(req_id, load_start_ns)
                     src_spec, dst_spec = transfer_spec
                     success = False
-                    prefetch_id = getattr(src_spec, "prefetch_id", None)
-                    if prefetch_id:
+                    preload_id = getattr(src_spec, "preload_id", None)
+                    if preload_id:
                         handler = self.worker.transfer_type_to_handler.get(
                             (src_spec.medium(), dst_spec.medium())
                         )
                         if handler is not None and hasattr(
-                            handler, "load_from_prefetch_async"
+                            handler, "load_from_preload_async"
                         ):
                             with profile_scope(
-                                "offload_worker.submit_prefetch_placement",
+                                "offload_worker.submit_preload_placement",
                                 "kv_offload",
                                 args={
                                     "job_id": job_id,
                                     "req_id": req_id,
-                                    "prefetch_id": prefetch_id,
+                                    "preload_id": preload_id,
                                 },
                             ):
                                 try:
-                                    success = handler.load_from_prefetch_async(
+                                    success = handler.load_from_preload_async(
                                         job_id,
-                                        prefetch_id,
+                                        preload_id,
                                         src_spec,
                                         dst_spec,
                                         profile_tid=tid,
@@ -498,33 +507,33 @@ class OffloadingConnectorWorker:
                                     )
                                 except Exception:
                                     logger.warning(
-                                        "Failed to submit KV offload prefetch "
+                                        "Failed to submit KV offload preload "
                                         "placement %s for request %s",
-                                        prefetch_id,
+                                        preload_id,
                                         req_id,
                                         exc_info=True,
                                     )
                             profiler.add_event(
-                                name="offload_worker.submit_prefetch_placement",
+                                name="offload_worker.submit_preload_placement",
                                 category="kv_offload",
                                 start_ns=load_start_ns,
                                 duration_ns=time.perf_counter_ns() - load_start_ns,
                                 tid=tid,
                                 args={
                                     "req_id": req_id,
-                                    "prefetch_id": prefetch_id,
+                                    "preload_id": preload_id,
                                     "submitted": success,
                                 },
                             )
                     if not success:
-                        if prefetch_id:
+                        if preload_id:
                             profiler.add_event(
-                                name="offload_worker.prefetch_fallback",
+                                name="offload_worker.preload_fallback",
                                 category="kv_offload",
                                 start_ns=time.perf_counter_ns(),
                                 duration_ns=0,
                                 tid=tid,
-                                args={"req_id": req_id, "prefetch_id": prefetch_id},
+                                args={"req_id": req_id, "preload_id": preload_id},
                             )
                         with profile_scope(
                             "offload_worker.submit_load_transfer",
@@ -535,6 +544,14 @@ class OffloadingConnectorWorker:
                                 job_id, transfer_spec, profile_tid=tid, req_id=req_id
                             )
                     assert success
+
+    def handle_worker_message(self, metadata: OffloadingWorkerMessageMetadata) -> bool:
+        with profile_scope(
+            "offload_worker.handle_worker_message",
+            "kv_offload",
+            args={"message_type": type(metadata.message).__name__},
+        ):
+            return self.worker.handle_worker_message(metadata.message)
 
     def prepare_store_kv(self, metadata: OffloadingConnectorMetadata):
         with profile_scope(
@@ -665,15 +682,14 @@ class OffloadingConnectorWorker:
             return kv_connector_stats
 
     def shutdown(self) -> None:
-        with profile_scope("offload_worker.shutdown", "kv_offload"):
-            # Drop deferred store jobs: there is no point in submitting
-            # them during shutdown.
-            self._unsubmitted_store_jobs.clear()
-            self._store_queue_time_ns.clear()
-            self._load_submit_time_ns.clear()
-            self._jobs.clear()
-            self._load_job.clear()
-            self._store_jobs.clear()
-            self._finished_reqs_waiting_for_store.clear()
-            self._req_profile_tid.clear()
-            self.worker.shutdown()
+        # Drop deferred store jobs: there is no point in submitting
+        # them during shutdown.
+        self._unsubmitted_store_jobs.clear()
+        self._store_queue_time_ns.clear()
+        self._load_submit_time_ns.clear()
+        self._jobs.clear()
+        self._load_job.clear()
+        self._store_jobs.clear()
+        self._finished_reqs_waiting_for_store.clear()
+        self._req_profile_tid.clear()
+        self.worker.shutdown()

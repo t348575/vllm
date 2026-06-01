@@ -155,6 +155,9 @@ class EngineCore:
         self.use_spec_decode = vllm_config.speculative_config is not None
         if self.scheduler.connector is not None:  # type: ignore
             self.model_executor.init_kv_output_aggregator(self.scheduler.connector)  # type: ignore
+            self._set_offload_worker_message_callback(
+                self._submit_offload_worker_message
+            )
 
         mm_registry = MULTIMODAL_REGISTRY
         self.mm_receiver_cache = mm_registry.engine_receiver_cache_from_config(
@@ -403,6 +406,32 @@ class EngineCore:
         )
         self._iteration_index += 1
 
+    def _submit_offload_worker_message(self, metadata: Any) -> None:
+        start_ns = time.perf_counter_ns()
+        self.model_executor.collective_rpc(
+            "handle_kv_connector_worker_message",
+            args=(metadata,),
+            non_block=True,
+        )
+        if getattr(profiler, "_active", False):
+            profiler.add_event(
+                "engine_core.submit_offload_worker_message",
+                "kv_offload",
+                start_ns,
+                time.perf_counter_ns() - start_ns,
+                args={
+                    "message_type": type(
+                        getattr(metadata, "message", None)
+                    ).__name__,
+                },
+            )
+
+    def _set_offload_worker_message_callback(self, callback: Callable | None) -> None:
+        connector = getattr(self.scheduler, "connector", None)
+        set_message_callback = getattr(connector, "set_worker_message_callback", None)
+        if set_message_callback is not None:
+            set_message_callback(callback)
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
         """Schedule, execute, and make output.
 
@@ -600,6 +629,8 @@ class EngineCore:
 
     def shutdown(self):
         self.structured_output_manager.clear_backend()
+        if self.scheduler:
+            self._set_offload_worker_message_callback(None)
         if self.model_executor:
             self.model_executor.shutdown()
         if self.scheduler:

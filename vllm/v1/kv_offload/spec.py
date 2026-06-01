@@ -3,7 +3,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 
@@ -102,6 +102,7 @@ class OffloadingSpec(ABC):
 
         # offloaded_block_size / gpu_block_size
         self.block_size_factor: int = 1
+        self._worker_message_sender: Callable[[Any], None] | None = None
 
         offloaded_block_size = self.extra_config.get("block_size")
         if offloaded_block_size is not None:
@@ -116,6 +117,16 @@ class OffloadingSpec(ABC):
 
             assert offloaded_block_size_int % gpu_block_size == 0
             self.block_size_factor = offloaded_block_size_int // gpu_block_size
+
+    def set_worker_message_sender(
+        self, sender: Callable[[Any], None] | None
+    ) -> None:
+        self._worker_message_sender = sender
+
+    def send_worker_message(self, message: Any) -> None:
+        if self._worker_message_sender is None:
+            return
+        self._worker_message_sender(message)
 
     @abstractmethod
     def get_manager(self) -> OffloadingManager:

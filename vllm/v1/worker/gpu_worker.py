@@ -747,6 +747,21 @@ class Worker(WorkerBase):
             return self.model_runner.sample_tokens(grammar_output)
 
     @torch.inference_mode()
+    def handle_kv_connector_worker_message(self, kv_connector_metadata: Any) -> bool:
+        with profile_scope(
+            "gpu_worker.handle_kv_connector_worker_message", "gpu_runner"
+        ):
+            if not has_kv_transfer_group():
+                return False
+            kv_connector = get_kv_transfer_group()
+            handle_message = getattr(
+                kv_connector, "handle_worker_message_from_metadata", None
+            )
+            if handle_message is None:
+                return False
+            return handle_message(kv_connector_metadata)
+
+    @torch.inference_mode()
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
