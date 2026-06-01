@@ -7,7 +7,7 @@ Core abstractions for KV cache offloading in vLLM v1.
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, NewType
+from typing import TYPE_CHECKING, Any, NewType
 
 import numpy as np
 import torch
@@ -343,11 +343,6 @@ class OffloadingSpec(ABC):
         assert kv_transfer_config is not None
         self.extra_config = kv_transfer_config.kv_connector_extra_config
 
-        # Optional scheduler->worker message relay, wired by the connector
-        # (see OffloadingConnectorScheduler.set_worker_message_callback). Used
-        # by storage backends to kick off a preload read at lookup time.
-        self._worker_message_sender: Callable[[Any], None] | None = None
-
         parallel_config = vllm_config.parallel_config
         context_parallel_factor = (
             parallel_config.decode_context_parallel_size
@@ -390,16 +385,6 @@ class OffloadingSpec(ABC):
 
             assert offloaded_block_size_int % gpu_block_size == 0
             self.block_size_factor = offloaded_block_size_int // gpu_block_size
-
-    def set_worker_message_sender(
-        self, sender: Callable[[Any], None] | None
-    ) -> None:
-        self._worker_message_sender = sender
-
-    def send_worker_message(self, message: Any) -> None:
-        if self._worker_message_sender is None:
-            return
-        self._worker_message_sender(message)
 
     @abstractmethod
     def get_manager(self) -> OffloadingManager:

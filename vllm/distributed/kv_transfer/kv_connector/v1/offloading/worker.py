@@ -328,9 +328,6 @@ class OffloadingConnectorWorker:
         slot = int(tid.split("_")[1])
         self._req_profile_slot_end_ns[slot] = end_ns
 
-    def get_req_profile_tid(self, req_id: ReqId) -> str | None:
-        return self._req_profile_tid.get(req_id)
-
     def set_req_profile_tids(self, tid_map: dict) -> None:
         self._req_profile_tid.update(tid_map)
 

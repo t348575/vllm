@@ -518,22 +518,20 @@ class OffloadingConnectorScheduler:
     def set_worker_message_callback(
         self, callback: Callable[[OffloadingWorkerMessageMetadata], None] | None
     ) -> None:
-        """Wire the spec/manager worker-message sender to the connector's
+        """Wire the manager worker-message sender to the connector's
         scheduler->worker relay. Used by storage backends to kick off a
         preload read at lookup time (before build_connector_meta)."""
         set_manager_sender = getattr(self.manager, "set_worker_message_sender", None)
+        if set_manager_sender is None:
+            return
         if callback is None:
-            self.spec.set_worker_message_sender(None)
-            if set_manager_sender is not None:
-                set_manager_sender(None)
-        else:
+            set_manager_sender(None)
+            return
 
-            def sender(message: Any) -> None:
-                callback(OffloadingWorkerMessageMetadata(message))
+        def sender(message: Any) -> None:
+            callback(OffloadingWorkerMessageMetadata(message))
 
-            self.spec.set_worker_message_sender(sender)
-            if set_manager_sender is not None:
-                set_manager_sender(sender)
+        set_manager_sender(sender)
 
     def _clear_preload_state(self, req_id: ReqId) -> None:
         self._req_preload_specs.pop(req_id, None)

@@ -24,7 +24,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.common import (
     OffloadingConnectorMetadata,
     OffloadingWorkerMessageMetadata,
     OffloadingWorkerMetadata,
-    ReqId,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.offloading.metrics import (
     OffloadingConnectorStats,
@@ -94,26 +93,6 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_worker is not None
         assert isinstance(self._connector_metadata, OffloadingConnectorMetadata)
         self.connector_worker.start_kv_transfers(self._connector_metadata)
-
-    def take_early_load_metadata(
-        self, connector_metadata: KVConnectorMetadata
-    ) -> KVConnectorMetadata | None:
-        assert self.connector_scheduler is not None
-        assert isinstance(connector_metadata, OffloadingConnectorMetadata)
-        if not connector_metadata.load_jobs:
-            return None
-
-        # Split the load jobs (and any preload hints) into an early metadata so
-        # the worker can start reads before the store/flush jobs are handled.
-        load_jobs = connector_metadata.load_jobs
-        reqs_to_preload = connector_metadata.reqs_to_preload
-        connector_metadata.load_jobs = {}
-        connector_metadata.reqs_to_preload = None
-        return OffloadingConnectorMetadata(
-            load_jobs=load_jobs,
-            store_jobs={},
-            reqs_to_preload=reqs_to_preload,
-        )
 
     def handle_worker_message_from_metadata(
         self, connector_metadata: KVConnectorMetadata
@@ -205,11 +184,6 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def take_events(self) -> Iterable[KVCacheEvent]:
         assert self.connector_scheduler is not None
         return self.connector_scheduler.take_events()
-
-    def get_req_profile_tid(self, req_id: ReqId) -> str | None:
-        if self.connector_worker is None:
-            return None
-        return self.connector_worker.get_req_profile_tid(req_id)
 
     def set_req_profile_tids(self, tid_map: dict) -> None:
         if self.connector_worker is not None:
