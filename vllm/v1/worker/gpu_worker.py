@@ -748,33 +748,21 @@ class Worker(WorkerBase):
 
     @torch.inference_mode()
     def handle_kv_connector_worker_message(self, kv_connector_metadata: Any) -> bool:
-        with profile_scope(
-            "gpu_worker.handle_kv_connector_worker_message", "gpu_runner"
-        ):
-            if not has_kv_transfer_group():
-                return False
-            kv_connector = get_kv_transfer_group()
-            handle_message = getattr(
-                kv_connector, "handle_worker_message_from_metadata", None
-            )
-            if handle_message is None:
-                return False
-            return handle_message(kv_connector_metadata)
+        if not has_kv_transfer_group():
+            return False
+        kv_connector = get_kv_transfer_group()
+        handle_message = getattr(
+            kv_connector, "handle_worker_message_from_metadata", None
+        )
+        if handle_message is None:
+            return False
+        return handle_message(kv_connector_metadata)
 
     @torch.inference_mode()
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        with profile_scope(
-            "gpu_worker.execute_model",
-            "gpu_runner",
-            args={
-                "num_scheduled_tokens": scheduler_output.total_num_scheduled_tokens,
-                "num_scheduled_reqs": len(scheduler_output.num_scheduled_tokens),
-                "has_kv_connector": has_kv_transfer_group(),
-            },
-        ):
-            return self._execute_model_profiled(scheduler_output)
+        return self._execute_model_profiled(scheduler_output)
 
     def _execute_model_profiled(
         self, scheduler_output: "SchedulerOutput"
@@ -839,10 +827,9 @@ class Worker(WorkerBase):
             )
 
         with self.annotate_profile(scheduler_output):
-            with profile_scope("gpu_worker.model_runner_execute_model", "gpu_runner"):
-                output = self.model_runner.execute_model(
-                    scheduler_output, intermediate_tensors
-                )
+            output = self.model_runner.execute_model(
+                scheduler_output, intermediate_tensors
+            )
             if (
                 self.use_v2_model_runner
                 and self.model_runner.is_pooling_model

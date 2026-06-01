@@ -167,17 +167,12 @@ class OffloadingWorker:
             return success
 
     def handle_worker_message(self, message: Any) -> bool:
-        with profile_scope(
-            "offloading_worker.handle_worker_message",
-            "kv_offload",
-            args={"num_handlers": len(self.handlers)},
-        ):
-            for handler in self.handlers:
-                handle_message = getattr(handler, "handle_worker_message", None)
-                if handle_message is None:
-                    continue
-                if handle_message(message):
-                    return True
+        for handler in self.handlers:
+            handle_message = getattr(handler, "handle_worker_message", None)
+            if handle_message is None:
+                continue
+            if handle_message(message):
+                return True
         return False
 
     def get_finished(self) -> list[TransferResult]:
@@ -187,15 +182,10 @@ class OffloadingWorker:
         Returns:
             A list of TransferResults
         """
-        with profile_scope(
-            "offloading_worker.get_finished",
-            "kv_offload",
-            args={"num_handlers": len(self.handlers)},
-        ):
-            finished = []
-            for handler in self.handlers:
-                finished.extend(handler.get_finished())
-            return finished
+        finished = []
+        for handler in self.handlers:
+            finished.extend(handler.get_finished())
+        return finished
 
     def wait(self, job_ids: set[int]) -> None:
         """

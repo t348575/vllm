@@ -407,24 +407,11 @@ class EngineCore:
         self._iteration_index += 1
 
     def _submit_offload_worker_message(self, metadata: Any) -> None:
-        start_ns = time.perf_counter_ns()
         self.model_executor.collective_rpc(
             "handle_kv_connector_worker_message",
             args=(metadata,),
             non_block=True,
         )
-        if getattr(profiler, "_active", False):
-            profiler.add_event(
-                "engine_core.submit_offload_worker_message",
-                "kv_offload",
-                start_ns,
-                time.perf_counter_ns() - start_ns,
-                args={
-                    "message_type": type(
-                        getattr(metadata, "message", None)
-                    ).__name__,
-                },
-            )
 
     def _set_offload_worker_message_callback(self, callback: Callable | None) -> None:
         connector = getattr(self.scheduler, "connector", None)
