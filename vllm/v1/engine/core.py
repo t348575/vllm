@@ -1246,9 +1246,12 @@ class EngineCoreProc(EngineCore):
             signal.signal(signal.SIGINT, signal.SIG_DFL)
             if signal_callback is not None:
                 signal_callback.stop()
+            # Flush the profiler trace before shutdown(): it tears down the CUDA
+            # context (GPU-event resolution needs it) and can hang in NCCL
+            # teardown, either of which would stop end_session from running.
+            profiler.end_session()
             if engine_core is not None:
                 engine_core.shutdown()
-            profiler.end_session()
 
     def _init_data_parallel(self, vllm_config: VllmConfig):
         pass

@@ -894,10 +894,12 @@ class WorkerProc:
                 ready_writer.close()
             if death_pipe is not None:
                 death_pipe.close()
+            # Flush the profiler trace before worker.shutdown() tears down the
+            # CUDA context / process group (same reason as EngineCore).
+            _simple_profiler.end_session()
             # Clean up once worker exits busy loop
             if worker is not None:
                 worker.shutdown()
-            _simple_profiler.end_session()
 
     class ResponseStatus(Enum):
         SUCCESS = auto()
