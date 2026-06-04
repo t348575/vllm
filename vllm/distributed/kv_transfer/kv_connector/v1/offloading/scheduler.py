@@ -41,6 +41,20 @@ from vllm.v1.request import Request
 logger = init_logger(__name__)
 
 
+def _parse_non_negative_int(value: Any, *, name: str) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a non-negative integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a non-negative integer") from exc
+    if parsed < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return parsed
+
+
 @dataclass(slots=True)
 class TransferJobStatus:
     """Tracks scheduler-side state for a single transfer job."""
@@ -243,6 +257,10 @@ class OffloadingConnectorScheduler:
         self.enable_preload = str(
             spec.extra_config.get("enable_preload", "false")
         ).lower() in {"1", "true", "yes", "on"}
+        self.preload_lookahead_requests = _parse_non_negative_int(
+            spec.extra_config.get("preload_lookahead_requests"),
+            name="preload_lookahead_requests",
+        )
 
         full_attention_groups: list[int] = []
         sliding_window_groups: list[int] = []
@@ -538,11 +556,18 @@ class OffloadingConnectorScheduler:
         self._reqs_to_preload.pop(req_id, None)
 
     def _compute_preload_keys(
-        self, req_status: RequestOffloadState, num_hit_tokens: int
+        self,
+        req_status: RequestOffloadState,
+        num_hit_tokens: int,
+        *,
+        full_prefix: bool = False,
     ) -> tuple[OffloadKey, ...]:
         """Best-effort hit keys for full-attention groups, mirroring the
         keys_to_load computation in update_state_after_alloc. Sliding-window
-        groups are skipped (their final load key set is determined at alloc)."""
+        groups are skipped (their final load key set is determined at alloc).
+
+        With ``full_prefix``, returns the whole offload-visible prefix without
+        applying the hit-token bound."""
         num_computed_tokens = req_status.num_locally_computed_tokens
         num_cached_tokens = num_computed_tokens + num_hit_tokens
         keys: list[OffloadKey] = []
@@ -554,17 +579,33 @@ class OffloadingConnectorScheduler:
             offloaded_block_size = group_config.offloaded_block_size
             offload_keys = group_state.offload_keys
             start_block_idx = num_computed_tokens // offloaded_block_size
-            num_blocks = min(
-                cdiv(num_cached_tokens, offloaded_block_size), len(offload_keys)
-            )
+            if full_prefix:
+                num_blocks = len(offload_keys)
+            else:
+                num_blocks = min(
+                    cdiv(num_cached_tokens, offloaded_block_size), len(offload_keys)
+                )
             keys.extend(offload_keys[start_block_idx:num_blocks])
         return tuple(keys)
 
     def _maybe_queue_preload(
-        self, req_status: RequestOffloadState, num_hit_tokens: int
+        self,
+        req_status: RequestOffloadState,
+        num_hit_tokens: int,
+        *,
+        full_prefix: bool = False,
+    ) -> None:
+        hit_keys = self._compute_preload_keys(
+            req_status, num_hit_tokens, full_prefix=full_prefix
+        )
+        self._queue_preload_keys(req_status, hit_keys)
+
+    def _queue_preload_keys(
+        self,
+        req_status: RequestOffloadState,
+        hit_keys: tuple[OffloadKey, ...],
     ) -> None:
         req_id = req_status.req.request_id
-        hit_keys = self._compute_preload_keys(req_status, num_hit_tokens)
         if not hit_keys:
             return
         existing = self._req_preload_specs.get(req_id)
@@ -580,9 +621,29 @@ class OffloadingConnectorScheduler:
                 self._make_preload_id(req_id, start_block_idx, len(hit_keys)),
             )
             self._req_preload_specs[req_id] = (hit_keys, src_spec)
-        else:
-            src_spec = existing[1]
-        self._reqs_to_preload[req_id] = src_spec
+            self._reqs_to_preload[req_id] = src_spec
+
+    def get_num_preload_candidate_requests(self) -> int:
+        if not self.enable_preload:
+            return 0
+        return self.preload_lookahead_requests
+
+    def on_preload_candidates(self, requests: Sequence[Request]) -> None:
+        if not self.enable_preload or self.preload_lookahead_requests <= 0:
+            return
+        for request in requests[: self.preload_lookahead_requests]:
+            # Do NOT persist state in _req_status: the eventual real
+            # get_num_new_matched_tokens would treat the request as not-new
+            # and skip update_num_hit_blocks. Use a transient state instead.
+            if request.request_id in self._req_status:
+                continue
+
+            req_status = RequestOffloadState(config=self.config, req=request)
+            # No lookup gate: the worker reactor owns the existence check via
+            # async openat. Mid-write blocks requeue on finish_write.
+            req_status.update_offload_keys()
+            req_status.num_locally_computed_tokens = 0
+            self._maybe_queue_preload(req_status, 0, full_prefix=True)
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int

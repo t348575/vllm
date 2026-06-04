@@ -802,6 +802,145 @@ def test_do_remote_decode_stores_all_blocks(request_runner, async_scheduling: bo
     assert runner.connector_scheduler._block_id_to_pending_jobs == {}
 
 
+def test_lookahead_preload_queues_waiting_candidate(request_runner):
+    runner = request_runner(
+        block_size_factor=1,
+        block_size=4,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+        enable_preload=True,
+        preload_lookahead_requests=1,
+    )
+    runner.scheduler.max_num_running_reqs = 1
+    runner.manager.lookup.return_value = True
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+
+    runner.new_request(token_ids=[1])
+    runner.new_request(token_ids=[0] * 4)
+
+    scheduler_output = runner.scheduler.schedule()
+    metadata = scheduler_output.kv_connector_metadata
+    assert metadata is not None
+    assert metadata.reqs_to_preload is not None
+    assert set(metadata.reqs_to_preload) == {"1"}
+    src_spec = metadata.reqs_to_preload["1"]
+    assert getattr(src_spec, "preload_id").startswith("1:")
+    assert len(src_spec.offload_keys) == 1
+
+
+def test_lookahead_preload_stops_at_mid_write(request_runner):
+    runner = request_runner(
+        block_size_factor=1,
+        block_size=4,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+        enable_preload=True,
+        preload_lookahead_requests=1,
+    )
+    runner.scheduler.max_num_running_reqs = 1
+    lookup_results = [True, None, True]
+
+    def lookup(_key, _req_context):
+        return lookup_results.pop(0) if lookup_results else False
+
+    runner.manager.lookup.side_effect = lookup
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+
+    runner.new_request(token_ids=[1])
+    runner.new_request(token_ids=[0] * 12)  # 3 offload blocks.
+
+    scheduler_output = runner.scheduler.schedule()
+    metadata = scheduler_output.kv_connector_metadata
+    assert metadata is not None
+    assert metadata.reqs_to_preload is not None
+    src_spec = metadata.reqs_to_preload["1"]
+    assert len(src_spec.offload_keys) == 1
+    assert runner.manager.lookup.call_count == 2
+
+
+def test_lookahead_preload_stops_at_hard_miss(request_runner):
+    runner = request_runner(
+        block_size_factor=1,
+        block_size=4,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+        enable_preload=True,
+        preload_lookahead_requests=1,
+    )
+    runner.scheduler.max_num_running_reqs = 1
+    lookup_results = [True, False, True]
+
+    def lookup(_key, _req_context):
+        return lookup_results.pop(0) if lookup_results else False
+
+    runner.manager.lookup.side_effect = lookup
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+
+    runner.new_request(token_ids=[1])
+    runner.new_request(token_ids=[0] * 12)  # 3 offload blocks.
+
+    scheduler_output = runner.scheduler.schedule()
+    metadata = scheduler_output.kv_connector_metadata
+    assert metadata is not None
+    assert metadata.reqs_to_preload is not None
+    src_spec = metadata.reqs_to_preload["1"]
+    assert len(src_spec.offload_keys) == 1
+    assert runner.manager.lookup.call_count == 2
+
+
+def test_lookahead_preload_skips_cold_prefix(request_runner):
+    runner = request_runner(
+        block_size_factor=1,
+        block_size=4,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+        enable_preload=True,
+        preload_lookahead_requests=1,
+    )
+    runner.scheduler.max_num_running_reqs = 1
+    runner.manager.lookup.return_value = False
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+
+    runner.new_request(token_ids=[1])
+    runner.new_request(token_ids=[0] * 12)
+
+    scheduler_output = runner.scheduler.schedule()
+    metadata = scheduler_output.kv_connector_metadata
+    assert metadata is not None
+    assert metadata.reqs_to_preload is None
+
+
+def test_lookahead_preload_disabled_by_default(request_runner):
+    runner = request_runner(
+        block_size_factor=1,
+        block_size=4,
+        num_gpu_blocks=100,
+        async_scheduling=False,
+        preload_lookahead_requests=1,
+    )
+    runner.scheduler.max_num_running_reqs = 1
+    runner.manager.lookup.return_value = True
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+
+    runner.new_request(token_ids=[1])
+    runner.new_request(token_ids=[0] * 4)
+
+    scheduler_output = runner.scheduler.schedule()
+    metadata = scheduler_output.kv_connector_metadata
+    assert metadata is not None
+    assert metadata.reqs_to_preload is None
+
+
 # ---------------------------------------------------------------------------
 # Tests for the per-job-store-completion design and fence invariants.
 # ---------------------------------------------------------------------------

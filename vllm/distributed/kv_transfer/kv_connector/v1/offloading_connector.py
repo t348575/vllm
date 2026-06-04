@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any
 
 import torch
@@ -104,6 +104,14 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
     def set_worker_message_callback(self, callback: Any | None) -> None:
         assert self.connector_scheduler is not None
         self.connector_scheduler.set_worker_message_callback(callback)
+
+    def get_num_preload_candidate_requests(self) -> int:
+        assert self.connector_scheduler is not None
+        return self.connector_scheduler.get_num_preload_candidate_requests()
+
+    def on_preload_candidates(self, requests: Sequence[Request]) -> None:
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.on_preload_candidates(requests)
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass

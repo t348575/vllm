@@ -170,6 +170,8 @@ class RequestRunner:
         block_size_factor: int = 1,
         async_scheduling: bool = True,
         kv_cache_groups: list[KVCacheGroupSpec] | None = None,
+        enable_preload: bool = False,
+        preload_lookahead_requests: int = 0,
     ):
         assert block_size_factor == 1 or kv_cache_groups is None, (
             "block_size_factor > 1 requires all groups to have the same "
@@ -196,6 +198,10 @@ class RequestRunner:
         }
         if block_size_factor > 1:
             extra_config["block_size"] = block_size * block_size_factor
+        if enable_preload:
+            extra_config["enable_preload"] = True
+        if preload_lookahead_requests:
+            extra_config["preload_lookahead_requests"] = preload_lookahead_requests
 
         vllm_config.kv_transfer_config = KVTransferConfig(
             kv_connector="OffloadingConnector",
@@ -607,6 +613,8 @@ def request_runner():
         async_scheduling,
         block_size_factor=1,
         kv_cache_groups=None,
+        enable_preload=False,
+        preload_lookahead_requests=0,
     ):
         runner = RequestRunner(
             block_size=block_size,
@@ -614,6 +622,8 @@ def request_runner():
             block_size_factor=block_size_factor,
             async_scheduling=async_scheduling,
             kv_cache_groups=kv_cache_groups,
+            enable_preload=enable_preload,
+            preload_lookahead_requests=preload_lookahead_requests,
         )
         runners.append(runner)
         return runner

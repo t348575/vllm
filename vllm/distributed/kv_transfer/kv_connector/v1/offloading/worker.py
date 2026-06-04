@@ -350,6 +350,13 @@ class OffloadingConnectorWorker:
             )
             if handler is None or not hasattr(handler, "preload_async"):
                 continue
+            num_blocks = len(
+                getattr(
+                    src_spec,
+                    "block_hashes",
+                    getattr(src_spec, "offload_keys", ()),
+                )
+            )
             start_ns = time.perf_counter_ns()
             tid = self._get_or_alloc_req_tid(req_id, start_ns)
             submitted = False
@@ -375,6 +382,7 @@ class OffloadingConnectorWorker:
                         "req_id": req_id,
                         "preload_id": preload_id,
                         "submitted": submitted,
+                        "num_blocks": num_blocks,
                     },
                 )
 

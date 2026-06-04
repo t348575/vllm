@@ -907,6 +907,7 @@ class Scheduler(SchedulerInterface):
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
         if self.connector is not None:
+            self._notify_preload_candidates(self.connector)
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
 
@@ -925,6 +926,47 @@ class Scheduler(SchedulerInterface):
         self, connector: KVConnectorBase_V1, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
+
+    def _get_preload_candidate_requests(self, limit: int) -> list[Request]:
+        if limit <= 0:
+            return []
+
+        if self.policy == SchedulingPolicy.FCFS:
+            candidates: Iterable[Request] = itertools.chain(
+                self.skipped_waiting, self.waiting
+            )
+        else:
+            ordered = list(self.waiting) + list(self.skipped_waiting)
+            ordered.sort()
+            candidates = ordered
+
+        result: list[Request] = []
+        seen_req_ids: set[str] = set()
+        for request in candidates:
+            req_id = request.request_id
+            if req_id in seen_req_ids:
+                continue
+            seen_req_ids.add(req_id)
+            if request.is_finished() or self._is_blocked_waiting_status(
+                request.status
+            ):
+                continue
+            result.append(request)
+            if len(result) == limit:
+                break
+        return result
+
+    def _notify_preload_candidates(
+        self, connector: KVConnectorBase_V1
+    ) -> None:
+        if not self.waiting and not self.skipped_waiting:
+            return
+        limit = connector.get_num_preload_candidate_requests()
+        if limit <= 0:
+            return
+        candidates = self._get_preload_candidate_requests(limit)
+        if candidates:
+            connector.on_preload_candidates(candidates)
 
     def _preempt_request(self, request: Request, timestamp: float) -> None:
         """Preempt a request and put it back to the waiting queue.

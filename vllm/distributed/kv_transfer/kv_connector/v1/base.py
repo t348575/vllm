@@ -42,7 +42,7 @@ The class provides the following primitives:
 
 import enum
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
@@ -448,6 +448,15 @@ class KVConnectorBase_V1(ABC):
         Args:
             gpu_block_pool: the GPU block pool.
         """
+        return
+
+    def get_num_preload_candidate_requests(self) -> int:
+        """Return how many waiting requests to expose for preload lookahead."""
+        return 0
+
+    def on_preload_candidates(self, requests: Sequence["Request"]) -> None:
+        """Called after the current step is scheduled, before connector
+        metadata is built, with likely future waiting requests."""
         return
 
     @abstractmethod
