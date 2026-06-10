@@ -146,6 +146,11 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
             return self.connector_worker.build_connector_worker_meta()
         return None
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        if self.connector_worker is None:
+            return set()
+        return self.connector_worker.get_block_ids_with_load_errors()
+
     @profile_category("kv_offload")
     def get_num_new_matched_tokens(
         self, request: "Request", num_computed_tokens: int

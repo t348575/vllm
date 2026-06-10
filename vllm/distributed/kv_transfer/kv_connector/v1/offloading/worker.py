@@ -521,6 +521,17 @@ class OffloadingConnectorWorker:
         self._connector_worker_meta = OffloadingWorkerMetadata()
         return meta
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        """GPU block ids of loads a storage backend declined (e.g. prefix-cache
+        break-even gating). Surfaced as vLLM invalid_block_ids so the scheduler
+        recomputes them. Backends that don't gate return nothing."""
+        declined: set[int] = set()
+        for handler in set(self.worker.transfer_type_to_handler.values()):
+            getter = getattr(handler, "get_declined_block_ids", None)
+            if getter is not None:
+                declined |= getter()
+        return declined
+
     def get_kv_connector_stats(self) -> KVConnectorStats | None:
         """
         Get the KV transfer stats for the connector.
