@@ -36,6 +36,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
     OffloadingConnectorWorker,
 )
 from vllm.forward_context import ForwardContext
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -43,6 +44,8 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
@@ -57,6 +60,16 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         kv_cache_config: KVCacheConfig,
     ):
         super().__init__(vllm_config, role, kv_cache_config)
+
+        # Offloading relies on recomputing load failures.
+        kt = vllm_config.kv_transfer_config
+        if kt is not None and kt.kv_load_failure_policy != "recompute":
+            logger.info(
+                "OffloadingConnector requires kv_load_failure_policy='recompute'; "
+                "overriding configured value %r.",
+                kt.kv_load_failure_policy,
+            )
+            kt.kv_load_failure_policy = "recompute"
 
         spec = OffloadingSpecFactory.create_spec(vllm_config, kv_cache_config)
 
@@ -73,7 +86,6 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
         if self.connector_scheduler is not None:
             self.connector_scheduler.shutdown()
 
-    @profile_category("kv_offload")
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         assert self.connector_worker is not None
         self.connector_worker.register_kv_caches(kv_caches)
@@ -141,15 +153,14 @@ class OffloadingConnector(KVConnectorBase_V1, SupportsHMA):
 
         return self.connector_worker.get_finished(finished_req_ids)
 
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        assert self.connector_worker is not None
+        return self.connector_worker.get_block_ids_with_load_errors()
+
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         if self.connector_worker is not None:
             return self.connector_worker.build_connector_worker_meta()
         return None
-
-    def get_block_ids_with_load_errors(self) -> set[int]:
-        if self.connector_worker is None:
-            return set()
-        return self.connector_worker.get_block_ids_with_load_errors()
 
     @profile_category("kv_offload")
     def get_num_new_matched_tokens(

@@ -2802,7 +2802,6 @@ class GPUModelRunner(
             logits_indices=logits_indices,
         )
 
-    @profile_category("gpu_runner")
     def _prepare_kv_sharing_fast_prefill(
         self,
         logits_indices: torch.Tensor,
@@ -2870,7 +2869,6 @@ class GPUModelRunner(
 
         return mm_hashes, mm_kwargs, mm_lora_refs
 
-    @profile_category("gpu_runner")
     def _execute_mm_encoder(
         self, scheduler_output: "SchedulerOutput"
     ) -> list[torch.Tensor]:
@@ -4070,12 +4068,11 @@ class GPUModelRunner(
             # Disable cascade attention when using microbatching (DBO)
             if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
                 # Pre-compute cascade attention prefix lengths
-                with profile_scope("gpu_runner.compute_cascade_attn_prefix_lens", "gpu_runner"):
-                    cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
-                        num_scheduled_tokens_np,
-                        self.input_batch.num_computed_tokens_cpu[:num_reqs],
-                        scheduler_output.num_common_prefix_blocks,
-                    )
+                cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
+                    num_scheduled_tokens_np,
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs],
+                    scheduler_output.num_common_prefix_blocks,
+                )
 
             (
                 cudagraph_mode,
@@ -4137,11 +4134,7 @@ class GPUModelRunner(
                 # to decide copy operations, so we must apply deferred
                 # corrections before it runs.
                 if deferred_state_corrections_fn:
-                    with profile_scope(
-                        "gpu_runner.apply_deferred_state_corrections_before_mamba",
-                        "gpu_runner",
-                    ):
-                        deferred_state_corrections_fn()
+                    deferred_state_corrections_fn()
                     deferred_state_corrections_fn = None
                 mamba_bufs = self._get_mamba_bufs()
                 mamba_utils.preprocess_mamba(
@@ -4292,13 +4285,12 @@ class GPUModelRunner(
 
                 if self.is_pooling_model:
                     # Return the pooling output.
-                    with profile_scope("gpu_runner.pool", "gpu_runner"):
-                        return self._pool(
-                            hidden_states,
-                            num_scheduled_tokens,
-                            num_scheduled_tokens_np,
-                            kv_connector_output,
-                        )
+                    return self._pool(
+                        hidden_states,
+                        num_scheduled_tokens,
+                        num_scheduled_tokens_np,
+                        kv_connector_output,
+                    )
 
                 sample_hidden_states = hidden_states[logits_indices]
                 with profile_gpu_scope(f"compute_logits(step={step})", "model"):
@@ -4352,11 +4344,7 @@ class GPUModelRunner(
         # Now the batch has been launched we can wait for corrections from the
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
-            with profile_scope(
-                "gpu_runner.apply_deferred_state_corrections_after_forward",
-                "gpu_runner",
-            ):
-                deferred_state_corrections_fn()
+            deferred_state_corrections_fn()
 
         return None
 

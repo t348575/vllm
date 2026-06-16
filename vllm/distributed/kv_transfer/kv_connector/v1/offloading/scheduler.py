@@ -283,6 +283,8 @@ class OffloadingConnectorScheduler:
         self._lookup_groups = tuple(full_attention_groups) + self._sliding_window_groups
 
         self._req_status: dict[ReqId, RequestOffloadState] = {}
+        # Requests whose load was declined; cleared when the request finishes.
+        self._declined_reqs: set[ReqId] = set()
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
         # Preload state: scheduler -> worker early read hints. At lookup time
@@ -621,6 +623,7 @@ class OffloadingConnectorScheduler:
                 self._make_preload_id(req_id, start_block_idx, len(hit_keys)),
             )
             self._req_preload_specs[req_id] = (hit_keys, src_spec)
+            # Avoid re-sending unchanged preload specs.
             self._reqs_to_preload[req_id] = src_spec
 
     def get_num_preload_candidate_requests(self) -> int:
@@ -632,15 +635,13 @@ class OffloadingConnectorScheduler:
         if not self.enable_preload or self.preload_lookahead_requests <= 0:
             return
         for request in requests[: self.preload_lookahead_requests]:
-            # Do NOT persist state in _req_status: the eventual real
-            # get_num_new_matched_tokens would treat the request as not-new
-            # and skip update_num_hit_blocks. Use a transient state instead.
+            # Tracked requests use the real lookup path for preload.
             if request.request_id in self._req_status:
                 continue
 
             req_status = RequestOffloadState(config=self.config, req=request)
-            # No lookup gate: the worker reactor owns the existence check via
-            # async openat. Mid-write blocks requeue on finish_write.
+
+            # Use transient state so real lookup still runs new-request init.
             req_status.update_offload_keys()
             req_status.num_locally_computed_tokens = 0
             self._maybe_queue_preload(req_status, 0, full_prefix=True)
@@ -667,6 +668,10 @@ class OffloadingConnectorScheduler:
                 - `True` if tokens will be loaded asynchronously
                   (between scheduler steps).
         """
+        # Avoid re-offering loads the worker declined.
+        if request.request_id in self._declined_reqs:
+            return 0, False
+
         is_new_request = False
         if req_status := self._req_status.get(request.request_id):
             # make sure block IDs are cleared
@@ -1039,6 +1044,7 @@ class OffloadingConnectorScheduler:
         if not isinstance(meta, OffloadingWorkerMetadata):
             assert meta is None
             meta = OffloadingWorkerMetadata()
+        self._declined_reqs |= meta.declined_req_ids
         for job_id, count in meta.completed_jobs.items():
             assert count > 0
             if job_id < self._stale_job_threshold:
@@ -1092,6 +1098,7 @@ class OffloadingConnectorScheduler:
             Optional KVTransferParams to be included in the request outputs
             returned by the engine.
         """
+        self._declined_reqs.discard(request.request_id)
         # TODO(orozery): possibly kickoff offload for last block
         # which may have been deferred due to async scheduling
         req_status = self._req_status.get(request.request_id)
@@ -1154,6 +1161,7 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs.clear()
         self._reqs_to_preload.clear()
         self._req_preload_specs.clear()
+        self._declined_reqs.clear()
 
         # Note: _current_batch_jobs_to_flush is intentionally NOT cleared.
         # The load flush IDs collected above must be delivered to workers.
