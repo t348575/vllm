@@ -35,4 +35,4 @@ Through testing, a clear break-even point exists for kv caching, when the cost o
 
 ### Profiling
 
-Various portions have been profiled using [t348575/simple-profiler](https://github.com/t348575/simple-profiler/) for performance investigation.
+Various portions have been decorated using [t348575/simple-profiler](https://github.com/t348575/simple-profiler/) for performance investigation.
