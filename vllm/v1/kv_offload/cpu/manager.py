@@ -193,6 +193,7 @@ class CPUOffloadingManager(OffloadingManager):
             # Blocks from the original input are excluded from eviction candidates:
             # a block that was already stored must remain in the cache after this call.
             protected = set(keys)
+            evict_start_ns = time.perf_counter_ns()
             evicted = self._policy.evict(num_blocks_to_evict, protected)
             if evicted is None:
                 if profiler._active:
@@ -213,6 +214,21 @@ class CPUOffloadingManager(OffloadingManager):
             for key, block in evicted:
                 self._free_block(block)
                 to_evict.append(key)
+            if profiler._active:
+                # Dedicated event for CPU memory-slot reclamation: fires whenever
+                # the cache policy (LRU/ARC) frees blocks to make room for a store.
+                profiler.add_event(
+                    "cpu_offload_manager.evict",
+                    "kv_offload",
+                    evict_start_ns,
+                    time.perf_counter_ns() - evict_start_ns,
+                    args={
+                        "num_evicted": len(to_evict),
+                        "requested": num_blocks_to_evict,
+                        "policy": type(self._policy).__name__,
+                        "free_blocks": self._get_num_free_blocks(),
+                    },
+                )
 
         if to_evict and self.events is not None:
             self.events.append(

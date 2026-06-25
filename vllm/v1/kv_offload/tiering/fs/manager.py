@@ -106,6 +106,7 @@ class FileSystemTierManager(SecondaryTierManager):
         return os.path.exists(self.file_mapper.get_file_name(key))
 
     def submit_store(self, job_metadata: JobMetadata) -> None:
+        req_id = job_metadata.req_context.req_id
         tasks = (
             functools.partial(
                 store_block,
@@ -113,12 +114,17 @@ class FileSystemTierManager(SecondaryTierManager):
                 self._primary_kv_view,
                 int(bid) * self._block_size,
                 self._block_size,
+                job_id=job_metadata.job_id,
+                req_id=req_id,
             )
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
-        self._pool.enqueue_store(job_metadata.job_id, len(job_metadata.keys), tasks)
+        self._pool.enqueue_store(
+            job_metadata.job_id, len(job_metadata.keys), tasks, req_id=req_id
+        )
 
     def submit_load(self, job_metadata: JobMetadata) -> None:
+        req_id = job_metadata.req_context.req_id
         tasks = (
             functools.partial(
                 load_block,
@@ -126,10 +132,14 @@ class FileSystemTierManager(SecondaryTierManager):
                 self._primary_kv_view,
                 int(bid) * self._block_size,
                 self._block_size,
+                job_id=job_metadata.job_id,
+                req_id=req_id,
             )
             for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
         )
-        self._pool.enqueue_load(job_metadata.job_id, len(job_metadata.keys), tasks)
+        self._pool.enqueue_load(
+            job_metadata.job_id, len(job_metadata.keys), tasks, req_id=req_id
+        )
 
     def get_finished(self) -> Iterable[JobResult]:
         """

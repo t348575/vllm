@@ -9,8 +9,11 @@ Thread pool:
 """
 
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Iterable
+
+from simple_profiler import profiler
 
 from vllm.logger import init_logger
 from vllm.v1.kv_offload.tiering.base import JobId
@@ -25,14 +28,34 @@ class JobState:
     Each task calls task_done(success) when it finishes.
     """
 
-    __slots__ = ("_job_id", "_n_tasks", "_completed", "_success", "_lock")
+    __slots__ = (
+        "_job_id",
+        "_n_tasks",
+        "_completed",
+        "_success",
+        "_lock",
+        "op",
+        "req_id",
+        "start_ns",
+    )
 
-    def __init__(self, job_id: JobId, n_tasks: int) -> None:
+    def __init__(
+        self,
+        job_id: JobId,
+        n_tasks: int,
+        op: str = "",
+        req_id: str = "",
+    ) -> None:
         self._job_id: JobId = job_id
         self._n_tasks = n_tasks
         self._completed = 0
         self._success = True
         self._lock = threading.Lock()
+        # Profiling metadata: op is "store"/"load", req_id anchors the job span
+        # to the request's Perfetto track, start_ns marks enqueue time.
+        self.op = op
+        self.req_id = req_id
+        self.start_ns = time.perf_counter_ns()
 
     @property
     def job_id(self) -> JobId:
@@ -94,9 +117,10 @@ class DualQueueThreadPool:
         job_id: JobId,
         n_tasks: int,
         tasks: Iterable[Callable],
+        req_id: str = "",
     ) -> None:
         """Enqueue load tasks for a job (high-priority for load-priority threads)."""
-        state = JobState(job_id, n_tasks)
+        state = JobState(job_id, n_tasks, op="load", req_id=req_id)
         with self._condition:
             for fn in tasks:
                 self._load_q.append((fn, state))
@@ -107,9 +131,10 @@ class DualQueueThreadPool:
         job_id: JobId,
         n_tasks: int,
         tasks: Iterable[Callable],
+        req_id: str = "",
     ) -> None:
         """Enqueue store tasks for a job (high-priority for store-priority threads)."""
-        state = JobState(job_id, n_tasks)
+        state = JobState(job_id, n_tasks, op="store", req_id=req_id)
         with self._condition:
             for fn in tasks:
                 self._store_q.append((fn, state))
@@ -155,4 +180,18 @@ class DualQueueThreadPool:
                 job_finished, success = state.task_done(False)
 
             if job_finished:
+                if profiler._active:
+                    # Job-level span on the request's track, covering enqueue ->
+                    # completion of all per-block I/O tasks. Per-block syscall
+                    # spans (fs_store_block/fs_load_block) land on the worker
+                    # thread tracks; this correlates them with the request.
+                    now_ns = time.perf_counter_ns()
+                    profiler.add_event(
+                        name=f"fs_{state.op}_job(job={state.job_id})",
+                        category="kv_fs",
+                        start_ns=state.start_ns,
+                        duration_ns=now_ns - state.start_ns,
+                        tid=state.req_id or None,
+                        args={"n_tasks": state._n_tasks, "success": success},
+                    )
                 self._finished_q.append((state.job_id, success))
