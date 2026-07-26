@@ -20,6 +20,7 @@ instead of embedding feature-specific logic directly.
 import functools
 import gc
 import time
+from contextlib import AbstractContextManager, nullcontext
 from copy import deepcopy
 from typing import Any, NamedTuple
 
@@ -27,6 +28,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from simple_profiler import profile_gpu_scope
 from vllm.compilation.counter import compilation_counter
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -244,6 +246,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+
+        # GPU profiling state: _profile_step counts completed steps,
+        # _profile_cur_step caches the current step for helper methods that
+        # don't receive it as an argument, and _profile_req_tid maps req_id
+        # to its profiling track id.
+        self._profile_step = 0
+        self._profile_cur_step = 0
+        self._profile_req_tid: dict[str, str] = {}
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -673,6 +683,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.prompt_logprobs_worker is not None:
             self.prompt_logprobs_worker.remove_request(req_id)
         self.lora_state.remove_request(req_id)
+        self._profile_req_tid.pop(req_id, None)
         return True
 
     def finish_requests(self, scheduler_output: SchedulerOutput) -> None:
@@ -716,6 +727,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 req_index, new_req_data.block_ids, overwrite=True
             )
             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
+
+            if (req_id not in self._profile_req_tid
+                    and scheduler_output.req_profile_tids):
+                tid = scheduler_output.req_profile_tids.get(req_id)
+                if tid:
+                    self._profile_req_tid[req_id] = tid
 
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
                 assert self.sampler is not None
@@ -940,7 +957,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
-        logits = self.model.compute_logits(sample_hidden_states)
+        with profile_gpu_scope(
+            f"compute_logits(step={self._profile_cur_step})", "model"
+        ):
+            logits = self.model.compute_logits(sample_hidden_states)
         if grammar_output is not None:
             # Apply grammar bitmask to the logits in-place.
             assert self.structured_outputs_worker is not None
@@ -1014,7 +1034,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        step = self._profile_step
         if not dummy_run:
+            # Dummy runs (warmup, cudagraph capture, DP padding) aren't real
+            # inference steps, so they don't advance the step counter.
+            self._profile_step += 1
+            self._profile_cur_step = step
+
             # Update the request states.
             self.finish_requests(scheduler_output)
             self.free_states(scheduler_output)
@@ -1164,6 +1190,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
             del intermediate_tensors
 
+        if dummy_run:
+            forward_profile_scope: AbstractContextManager = nullcontext()
+        else:
+            _active_tids = [(self._profile_req_tid[r], {"req_id": r})
+                            for r in scheduler_output.num_scheduled_tokens
+                            if r in self._profile_req_tid]
+            forward_profile_scope = profile_gpu_scope(
+                f"forward(step={step})", "model", tids=_active_tids or None
+            )
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -1171,7 +1207,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
             self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
+            with forward_profile_scope:
+                model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
@@ -1190,7 +1227,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_compiled=skip_compiled,
             ):
                 self.kv_connector.pre_forward(scheduler_output)
-                model_output = self.model(**model_inputs)
+                with forward_profile_scope:
+                    model_output = self.model(**model_inputs)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1253,9 +1291,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return None
 
         # Last rank: sample tokens
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
+        _sample_tids = [(self._profile_req_tid[r], {"req_id": r})
+                        for r in input_batch.req_ids
+                        if r in self._profile_req_tid]
+        with profile_gpu_scope(f"sample(step={self._profile_cur_step})", "model",
+                               tids=_sample_tids or None):
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output
+            )
 
         if self.use_pp:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).

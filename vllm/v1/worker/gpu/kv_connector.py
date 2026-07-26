@@ -68,6 +68,11 @@ class ActiveKVConnector(KVConnector):
         self.kv_connector.handle_preemptions(kv_connector_metadata)
         self.kv_connector.bind_connector_metadata(kv_connector_metadata)
 
+        # Share request TIDs so KV events land on per-request profiling tracks.
+        req_profile_tids = scheduler_output.req_profile_tids
+        if req_profile_tids and hasattr(self.kv_connector, "set_req_profile_tids"):
+            self.kv_connector.set_req_profile_tids(req_profile_tids)
+
         # TODO: sort out KV Connectors' use of forward_context
         if is_forward_context_available():
             self.kv_connector.start_load_kv(get_forward_context())

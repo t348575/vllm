@@ -5,8 +5,9 @@ import logging
 import os
 import random
 import threading
+import time
 
-from simple_profiler import profile_scope
+from simple_profiler import profiler
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,8 @@ def store_block(
     block_size: int,
     job_id: int = 0,
     req_id: str = "",
+    file_index: int = 0,
+    num_files: int = 1,
 ) -> None:
     """
     Store callback: Writes to a temp file then atomically replaces the destination.
@@ -46,42 +49,53 @@ def store_block(
     if os.path.exists(dest_path):
         return
 
-    with profile_scope(
-        "fs_store_block",
-        "kv_fs",
-        args={"block_size": block_size, "job_id": job_id, "req_id": req_id},
-    ):
-        tmp_path = dest_path + _get_tmp_suffix()
-        # Ensure parent directories exist
-        _ensure_dirs(dest_path)
+    tmp_path = dest_path + _get_tmp_suffix()
+    # Ensure parent directories exist
+    _ensure_dirs(dest_path)
 
-        # Write block atomically. Cast to a flat byte view so the slice uses byte
-        # indices; the raw memoryview may be multi-dimensional with itemsize > 1.
-        view_slice = buffer.cast("B")[offset : offset + block_size]
+    # Write block atomically. Cast to a flat byte view so the slice uses byte
+    # indices; the raw memoryview may be multi-dimensional with itemsize > 1.
+    view_slice = buffer.cast("B")[offset : offset + block_size]
+    try:
+        fd = os.open(
+            tmp_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_TRUNC | O_DIRECT,
+            0o644,
+        )
         try:
-            fd = os.open(
-                tmp_path,
-                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_TRUNC | O_DIRECT,
-                0o644,
-            )
-            try:
-                written = os.write(fd, view_slice)
-                if written < len(view_slice):
-                    raise OSError(
-                        f"Short write: expected {len(view_slice)} bytes, "
-                        f"wrote {written}"
-                    )
-            finally:
-                os.close(fd)
-            os.replace(tmp_path, dest_path)
-        except Exception:
-            try:
-                os.remove(tmp_path)
-            except OSError as cleanup_exc:
-                logger.warning(
-                    "Failed to remove temp file %s: %s", tmp_path, cleanup_exc
+            start_ns = time.perf_counter_ns()
+            written = os.write(fd, view_slice)
+            duration_ns = time.perf_counter_ns() - start_ns
+            if written < len(view_slice):
+                raise OSError(
+                    f"Short write: expected {len(view_slice)} bytes, "
+                    f"wrote {written}"
                 )
-            raise
+            profiler.add_event(
+                "py_kvcache.file_write",
+                "fs",
+                start_ns,
+                duration_ns,
+                tid=req_id or None,
+                args={
+                    "job_id": job_id,
+                    "req_id": req_id,
+                    "file_index": file_index,
+                    "num_files": num_files,
+                    "num_bytes": block_size,
+                },
+            )
+        finally:
+            os.close(fd)
+        os.replace(tmp_path, dest_path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError as cleanup_exc:
+            logger.warning(
+                "Failed to remove temp file %s: %s", tmp_path, cleanup_exc
+            )
+        raise
 
 
 def load_block(
@@ -91,32 +105,45 @@ def load_block(
     block_size: int,
     job_id: int = 0,
     req_id: str = "",
+    file_index: int = 0,
+    num_files: int = 1,
 ) -> None:
     """
     Load callback: read one KV block from disk. Remove the file on failure.
     """
-    with profile_scope(
-        "fs_load_block",
-        "kv_fs",
-        args={"block_size": block_size, "job_id": job_id, "req_id": req_id},
-    ):
-        fd: int | None = None
-        view_slice = view.cast("B")[offset : offset + block_size]
+    fd: int | None = None
+    view_slice = view.cast("B")[offset : offset + block_size]
+    try:
+        fd = os.open(source_path, os.O_RDONLY | O_DIRECT)
+        start_ns = time.perf_counter_ns()
+        bytes_read = os.readv(fd, [view_slice])
+        duration_ns = time.perf_counter_ns() - start_ns
+        if bytes_read < block_size:
+            raise OSError(
+                f"Short read: expected {block_size} bytes, read {bytes_read}"
+            )
+        profiler.add_event(
+            "py_kvcache.file_read",
+            "fs",
+            start_ns,
+            duration_ns,
+            tid=req_id or None,
+            args={
+                "job_id": job_id,
+                "req_id": req_id,
+                "file_index": file_index,
+                "num_files": num_files,
+                "num_bytes": block_size,
+            },
+        )
+    except Exception:
         try:
-            fd = os.open(source_path, os.O_RDONLY | O_DIRECT)
-            bytes_read = os.readv(fd, [view_slice])
-            if bytes_read < block_size:
-                raise OSError(
-                    f"Short read: expected {block_size} bytes, read {bytes_read}"
-                )
-        except Exception:
-            try:
-                os.remove(source_path)
-            except OSError as cleanup_exc:
-                logger.warning(
-                    "Failed to remove unreadable file %s: %s", source_path, cleanup_exc
-                )
-            raise
-        finally:
-            if fd is not None:
-                os.close(fd)
+            os.remove(source_path)
+        except OSError as cleanup_exc:
+            logger.warning(
+                "Failed to remove unreadable file %s: %s", source_path, cleanup_exc
+            )
+        raise
+    finally:
+        if fd is not None:
+            os.close(fd)

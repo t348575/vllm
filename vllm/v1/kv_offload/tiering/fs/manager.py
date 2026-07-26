@@ -116,8 +116,12 @@ class FileSystemTierManager(SecondaryTierManager):
                 self._block_size,
                 job_id=job_metadata.job_id,
                 req_id=req_id,
+                file_index=file_index,
+                num_files=len(job_metadata.keys),
             )
-            for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
+            for file_index, (key, bid) in enumerate(
+                zip(job_metadata.keys, job_metadata.block_ids)
+            )
         )
         self._pool.enqueue_store(
             job_metadata.job_id, len(job_metadata.keys), tasks, req_id=req_id
@@ -134,8 +138,12 @@ class FileSystemTierManager(SecondaryTierManager):
                 self._block_size,
                 job_id=job_metadata.job_id,
                 req_id=req_id,
+                file_index=file_index,
+                num_files=len(job_metadata.keys),
             )
-            for key, bid in zip(job_metadata.keys, job_metadata.block_ids)
+            for file_index, (key, bid) in enumerate(
+                zip(job_metadata.keys, job_metadata.block_ids)
+            )
         )
         self._pool.enqueue_load(
             job_metadata.job_id, len(job_metadata.keys), tasks, req_id=req_id
