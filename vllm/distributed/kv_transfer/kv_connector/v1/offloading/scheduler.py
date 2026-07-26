@@ -31,6 +31,8 @@ from vllm.v1.kv_offload.base import (
     OffloadingManager,
     OffloadingSpec,
     OffloadKey,
+    PlanCandidate,
+    PlanDecision,
     ReqContext,
     get_offload_block_hash,
     make_offload_key,
@@ -297,6 +299,9 @@ class OffloadingConnectorScheduler:
         self._req_preload_specs: dict[
             ReqId, tuple[tuple[OffloadKey, ...], LoadStoreSpec]
         ] = {}
+        # req_id -> preload_blocks, for requests the planner deferred in the
+        # last on_preload_candidates pass.
+        self._planned_preload_blocks: dict[ReqId, int] = {}
         # if GPU prefix caching is enabled,
         # track loaded blocks to avoid redundant loads
         self._blocks_being_loaded: set[OffloadKey] | None = (
@@ -556,6 +561,7 @@ class OffloadingConnectorScheduler:
     def _clear_preload_state(self, req_id: ReqId) -> None:
         self._req_preload_specs.pop(req_id, None)
         self._reqs_to_preload.pop(req_id, None)
+        self._planned_preload_blocks.pop(req_id, None)
 
     def _compute_preload_keys(
         self,
@@ -569,7 +575,10 @@ class OffloadingConnectorScheduler:
         groups are skipped (their final load key set is determined at alloc).
 
         With ``full_prefix``, returns the whole offload-visible prefix without
-        applying the hit-token bound."""
+        applying the hit-token bound. When there is more than one
+        full-attention group, this is their concatenation, not a per-group
+        prefix, so slicing it with ``[:preload_blocks]`` (the planner-priced
+        path) is only correct if there is a single such group."""
         num_computed_tokens = req_status.num_locally_computed_tokens
         num_cached_tokens = num_computed_tokens + num_hit_tokens
         keys: list[OffloadKey] = []
@@ -634,17 +643,86 @@ class OffloadingConnectorScheduler:
     def on_preload_candidates(self, requests: Sequence[Request]) -> None:
         if not self.enable_preload or self.preload_lookahead_requests <= 0:
             return
-        for request in requests[: self.preload_lookahead_requests]:
-            # Tracked requests use the real lookup path for preload.
-            if request.request_id in self._req_status:
-                continue
+        window = requests[: self.preload_lookahead_requests]
 
+        if not self.manager.supports_planned_defer_preload:
+            for request in window:
+                # Tracked requests use the real lookup path for preload.
+                if request.request_id in self._req_status:
+                    continue
+
+                req_status = RequestOffloadState(config=self.config, req=request)
+
+                # Use transient state so real lookup still runs new-request init.
+                req_status.update_offload_keys()
+                req_status.num_locally_computed_tokens = 0
+                self._maybe_queue_preload(req_status, 0, full_prefix=True)
+            return
+
+        candidates: list[PlanCandidate] = []
+        req_statuses: dict[ReqId, RequestOffloadState] = {}
+        candidate_keys: dict[ReqId, tuple[OffloadKey, ...]] = {}
+        for position, request in enumerate(window):
+            req_id = request.request_id
+            # Transient: must not be persisted into _req_status, or
+            # get_num_new_matched_tokens would treat this request as already
+            # tracked and skip update_num_hit_blocks.
             req_status = RequestOffloadState(config=self.config, req=request)
-
-            # Use transient state so real lookup still runs new-request init.
             req_status.update_offload_keys()
             req_status.num_locally_computed_tokens = 0
-            self._maybe_queue_preload(req_status, 0, full_prefix=True)
+            keys = self._compute_preload_keys(req_status, 0, full_prefix=True)
+            req_statuses[req_id] = req_status
+            candidate_keys[req_id] = keys
+            candidates.append(
+                PlanCandidate(
+                    position=position,
+                    req_id=req_id,
+                    recompute_tokens=request.num_tokens,
+                    keys=keys,
+                )
+            )
+
+        outstanding_load_blocks = [
+            len(status.keys) for status in self._jobs.values() if not status.is_store
+        ]
+        outcomes = self.manager.plan_candidates(candidates, outstanding_load_blocks)
+
+        # Rebuilt wholesale each step; a planned decision only holds for the
+        # step that produced it.
+        self._planned_preload_blocks = {
+            req_id: outcome.preload_blocks
+            for req_id, outcome in outcomes.items()
+            if outcome.decision == PlanDecision.DEFER and outcome.preload_blocks > 0
+        }
+
+        num_defers = len(self._planned_preload_blocks)
+        logger.debug(
+            "Offloading planner ran over %s candidates: %s DEFER",
+            len(candidates),
+            num_defers,
+        )
+
+        for candidate in candidates:
+            req_id = candidate.req_id
+            if req_id in self._req_status:
+                # Already-tracked requests are emitted by
+                # get_num_new_matched_tokens instead.
+                continue
+            preload_blocks = self._planned_preload_blocks.get(req_id)
+            if not preload_blocks:
+                continue
+            keys = candidate_keys[req_id]
+            if preload_blocks > len(keys):
+                logger.debug(
+                    "Planner reserved %s preload blocks for request %s but "
+                    "only %s keys are available; emitting %s",
+                    preload_blocks,
+                    req_id,
+                    len(keys),
+                    len(keys),
+                )
+                preload_blocks = len(keys)
+            self._queue_preload_keys(req_statuses[req_id], keys[:preload_blocks])
 
     def get_num_new_matched_tokens(
         self, request: Request, num_computed_tokens: int
@@ -693,10 +771,30 @@ class OffloadingConnectorScheduler:
 
         self._touch(req_status)
 
-        if self.enable_preload and num_hit_tokens:
-            # Kick off the storage read for the hit blocks now, overlapping it
-            # with GPU block allocation (the spec is reused at alloc time).
-            self._maybe_queue_preload(req_status, num_hit_tokens)
+        if self.enable_preload:
+            if num_hit_tokens:
+                # Kick off the storage read for the hit blocks now, overlapping
+                # it with GPU block allocation (the spec is reused at alloc
+                # time).
+                self._maybe_queue_preload(req_status, num_hit_tokens)
+            elif num_hit_tokens is None and self.manager.supports_planned_defer_preload:
+                # A planner-selected DEFER stages nothing on its own; queue the
+                # prefix priced at the last on_preload_candidates call so the
+                # deferral isn't pure loss.
+                preload_blocks = self._planned_preload_blocks.get(request.request_id)
+                if preload_blocks:
+                    keys = self._compute_preload_keys(req_status, 0, full_prefix=True)
+                    if preload_blocks > len(keys):
+                        logger.debug(
+                            "Planner reserved %s preload blocks for request %s "
+                            "but only %s keys are available; emitting %s",
+                            preload_blocks,
+                            request.request_id,
+                            len(keys),
+                            len(keys),
+                        )
+                        preload_blocks = len(keys)
+                    self._queue_preload_keys(req_status, keys[:preload_blocks])
 
         return num_hit_tokens, bool(num_hit_tokens)
 
@@ -1161,6 +1259,7 @@ class OffloadingConnectorScheduler:
         self._block_id_to_pending_jobs.clear()
         self._reqs_to_preload.clear()
         self._req_preload_specs.clear()
+        self._planned_preload_blocks.clear()
         self._declined_reqs.clear()
 
         # Note: _current_batch_jobs_to_flush is intentionally NOT cleared.

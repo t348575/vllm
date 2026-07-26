@@ -5,8 +5,9 @@ Core abstractions for KV cache offloading in vLLM v1.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import Collection, Iterable, Iterator, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Any, NewType
 
 import numpy as np
@@ -80,6 +81,28 @@ class OffloadingEvent:
     removed: bool
 
 
+class PlanDecision(str, Enum):
+    ADMIT = "admit"
+    DEFER = "defer"
+    DECLINE = "decline"
+
+
+@dataclass(frozen=True)
+class PlanCandidate:
+    """One scheduler-positioned load candidate offered to a planning manager."""
+
+    position: int
+    req_id: str
+    recompute_tokens: int  # tokens the GPU would recompute from a 0% prefix
+    keys: tuple[OffloadKey, ...]  # full offload-visible prefix, in order
+
+
+@dataclass(frozen=True)
+class PlanOutcome:
+    decision: PlanDecision
+    preload_blocks: int = 0  # leading prefix blocks the scheduler must emit
+
+
 """
 OffloadingManager class for managing KV data offloading in vLLM v1
 
@@ -124,6 +147,27 @@ class OffloadingManager(ABC):
             scheduler.
         """
         pass
+
+    @property
+    def supports_planned_defer_preload(self) -> bool:
+        """Whether this manager plans load decisions and expects the scheduler to
+        emit preloads for its planned deferrals."""
+        return False
+
+    def plan_candidates(
+        self,
+        candidates: Sequence[PlanCandidate],
+        outstanding_load_blocks: Sequence[int],
+    ) -> Mapping[str, PlanOutcome]:
+        """Score scheduler-positioned load candidates. Default: no planning.
+
+        Args:
+            candidates: candidates in scheduler run order; must not be
+                reordered.
+            outstanding_load_blocks: block counts of load jobs the worker has
+                been handed and not yet reported finished.
+        """
+        return {}
 
     @abstractmethod
     def prepare_load(
